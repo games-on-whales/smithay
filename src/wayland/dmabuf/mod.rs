@@ -1180,10 +1180,20 @@ impl DmabufParamsData {
             DmabufFlags::from_bits_truncate(flags.into()),
         );
 
+        planes.sort_by_key(|plane| plane.plane_idx);
         for (i, plane) in planes.drain(..).enumerate() {
+            if plane.plane_idx != i as u32 {
+                // After sorting, plane indices should be consecutive and start at 0.
+                params.post_error(
+                    zwp_linux_buffer_params_v1::Error::Incomplete,
+                    "missing or too many planes to create a buffer",
+                );
+                return None;
+            }
+            let plane_idx = plane.plane_idx;
             let offset = plane.offset;
             let stride = plane.stride;
-            buf.add_plane(plane.into(), i as u32, offset, stride);
+            buf.add_plane(plane.into(), plane_idx, offset, stride);
         }
 
         #[cfg(feature = "backend_drm")]
