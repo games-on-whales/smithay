@@ -214,10 +214,19 @@ pub(crate) fn enter_internal<D: SeatHandler + 'static>(
         kbd.enter(serial.into(), surface, serialized_keys.clone())
     });
 
-    let seat_clone = seat.clone();
+    // Hold the seat weakly: the hook lives in the surface's data map, and the keyboard
+    // focus holds the surface, so a strong `Seat` here forms a cycle (surface data -> seat
+    // -> keyboard focus -> surface) that leaks the seat (and its keymap memfd) if the
+    // surface is still focused at teardown.
+    let weak_seat = seat.downgrade();
     let hook_id = add_destruction_hook::<D, _>(surface, move |_, surface| {
+        let Some(seat) = weak_seat.upgrade() else {
+            return;
+        };
         if let Some(client) = surface.client() {
-            let keyboard = seat_clone.get_keyboard().unwrap();
+            let Some(keyboard) = seat.get_keyboard() else {
+                return;
+            };
             let inner = keyboard.arc.known_kbds.lock().unwrap();
             for kbd in &*inner {
                 let Ok(kbd) = kbd.upgrade() else {
