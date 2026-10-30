@@ -7,7 +7,7 @@ use std::{
     mem::MaybeUninit,
     ops::Deref,
     os::unix::io::{AsRawFd, FromRawFd, OwnedFd},
-    sync::{Arc, LazyLock, Mutex, Weak},
+    sync::{Arc, LazyLock, Mutex, PoisonError, Weak},
 };
 
 use indexmap::IndexSet;
@@ -104,9 +104,19 @@ impl Drop for EGLDisplayHandle {
     #[inline]
     fn drop(&mut self) {
         if self.should_terminate {
-            unsafe {
-                // ignore errors on drop
-                ffi::egl::Terminate(self.handle);
+            // `EGLDisplay::new` replaces an entry whose strong count already reached zero, so
+            // another thread may have created (and initialized) a new handle for this same
+            // native display while this one was being dropped. Terminating now would pull the
+            // display out from under it; the new handle terminates it when it is dropped.
+            let displays = DISPLAYS.lock().unwrap_or_else(PoisonError::into_inner);
+            let replaced = displays
+                .iter()
+                .any(|other| other.ptr == self.handle && other.handle.strong_count() != 0);
+            if !replaced {
+                unsafe {
+                    // ignore errors on drop
+                    ffi::egl::Terminate(self.handle);
+                }
             }
         }
     }
@@ -230,11 +240,20 @@ impl EGLDisplay {
 
             let mut displays = DISPLAYS.lock().unwrap();
             displays.retain(|handle| handle.handle.strong_count() != 0);
-            if displays.insert(weak_disp.clone()) {
-                new_display
-            } else {
-                Arc::try_unwrap(new_display).unwrap().should_terminate = false;
-                displays.get(&weak_disp).unwrap().handle.upgrade().unwrap()
+            // The existing handle's last reference can drop after the retain above, so
+            // upgrading it may fail: then this handle replaces it.
+            match displays
+                .get(&weak_disp)
+                .and_then(|handle| handle.handle.upgrade())
+            {
+                Some(existing) => {
+                    Arc::try_unwrap(new_display).unwrap().should_terminate = false;
+                    existing
+                }
+                None => {
+                    displays.replace(weak_disp);
+                    new_display
+                }
             }
         };
 
