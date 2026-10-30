@@ -10,22 +10,21 @@
 //! extern crate wayland_server;
 //!
 //! use smithay::wayland::cursor_shape::CursorShapeManagerState;
-//! use smithay::delegate_cursor_shape;
 //!
-//! # use smithay::backend::input::KeyState;
+//! # use smithay::backend::input::{InputTime, KeyState, TabletToolDescriptor};
 //! # use smithay::input::{
 //! #   pointer::{PointerTarget, AxisFrame, MotionEvent, ButtonEvent, RelativeMotionEvent,
 //! #             GestureSwipeBeginEvent, GestureSwipeUpdateEvent, GestureSwipeEndEvent,
 //! #             GesturePinchBeginEvent, GesturePinchUpdateEvent, GesturePinchEndEvent,
 //! #             GestureHoldBeginEvent, GestureHoldEndEvent},
 //! #   keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
-//! #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget},
+//! #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget, FrameMarker},
+//! #   tablet::{Tablet, TabletSeatHandler, tool::{self, TabletToolTarget}},
 //! #   Seat, SeatHandler, SeatState,
 //! # };
 //! # use smithay::utils::{IsAlive, Serial};
 //! # use smithay::wayland::seat::WaylandFocus;
 //! # use wayland_server::protocol::wl_surface;
-//! # use smithay::wayland::tablet_manager::TabletSeatHandler;
 //!
 //! # #[derive(Debug, Clone, PartialEq)]
 //! # struct Target;
@@ -45,7 +44,7 @@
 //! #   fn button(&self, seat: &Seat<State>, data: &mut State, event: &ButtonEvent) {}
 //! #   fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {}
 //! #   fn frame(&self, seat: &Seat<State>, data: &mut State) {}
-//! #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {}
+//! #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: InputTime) {}
 //! #   fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {}
 //! #   fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {}
 //! #   fn gesture_swipe_end(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeEndEvent) {}
@@ -65,18 +64,29 @@
 //! #       key: KeysymHandle<'_>,
 //! #       state: KeyState,
 //! #       serial: Serial,
-//! #       time: u32,
+//! #       time: InputTime,
 //! #   ) {}
 //! #   fn modifiers(&self, seat: &Seat<State>, data: &mut State, modifiers: ModifiersState, serial: Serial) {}
 //! # }
 //! # impl TouchTarget<State> for Target {
-//! #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent, seq: Serial) {}
-//! #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent, seq: Serial) {}
-//! #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent, seq: Serial) {}
-//! #   fn frame(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-//! #   fn cancel(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-//! #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent, seq: Serial) {}
-//! #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent, seq: Serial) {}
+//! #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent) {}
+//! #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent) {}
+//! #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent) {}
+//! #   fn frame(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+//! #   fn cancel(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+//! #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent) {}
+//! #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent) {}
+//! #   fn last_frame(&self, seat: &Seat<State>, data: &mut State) -> Option<FrameMarker> { unimplemented!() }
+//! # }
+//! # impl TabletToolTarget<State> for Target {
+//! #   fn proximity_in(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, tablet: &Tablet, serial: Serial) {}
+//! #   fn proximity_out(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor) {}
+//! #   fn down(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, event: &tool::DownEvent) {}
+//! #   fn up(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, event: &tool::UpEvent) {}
+//! #   fn motion(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, event: &tool::MotionEvent) {}
+//! #   fn axis(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, frame: tool::AxisFrame) {}
+//! #   fn button(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, event: &tool::ButtonEvent) {}
+//! #   fn frame(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, time: InputTime) {}
 //! # }
 //! # struct State {
 //! #     seat_state: SeatState<Self>,
@@ -91,11 +101,13 @@
 //! #         &mut self.seat_state
 //! #     }
 //! # }
-//! # impl TabletSeatHandler for State {}
+//! # impl TabletSeatHandler for State {
+//! #     type ToolFocus = Target;
+//! # }
 //!
 //! let state = CursorShapeManagerState::new::<State>(&display.handle());
 //!
-//! delegate_cursor_shape!(State);
+//! smithay::delegate_dispatch2!(State);
 //! ```
 
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::Request as ShapeRequest;
@@ -108,16 +120,17 @@ use wayland_server::GlobalDispatch;
 use wayland_server::Resource;
 use wayland_server::WEnum;
 use wayland_server::Weak;
-use wayland_server::{backend::GlobalId, Dispatch, DisplayHandle};
+use wayland_server::{Dispatch, DisplayHandle, backend::GlobalId};
 
-use crate::input::pointer::{CursorIcon, CursorImageStatus};
 use crate::input::SeatHandler;
 use crate::input::WeakSeat;
+use crate::input::pointer::{CursorIcon, CursorImageStatus, PointerHandle};
+use crate::input::tablet::TabletSeatHandler;
 use crate::utils::Serial;
-use crate::wayland::seat::{pointer::allow_setting_cursor, WaylandFocus};
-
-use super::seat::PointerUserData;
-use super::tablet_manager::{TabletSeatHandler, TabletToolUserData};
+use crate::wayland::seat::{WaylandFocus, pointer::allow_setting_cursor};
+use crate::wayland::tablet_manager::TabletToolUserData;
+use crate::wayland::tablet_manager::tablet_tool;
+use crate::wayland::{Dispatch2, GlobalData, GlobalDispatch2};
 
 /// State of the cursor shape manager.
 #[derive(Debug)]
@@ -129,12 +142,12 @@ impl CursorShapeManagerState {
     /// Register new [CursorShapeManager] global.
     pub fn new<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<CursorShapeManager, ()>,
-        D: Dispatch<CursorShapeManager, ()>,
+        D: GlobalDispatch<CursorShapeManager, GlobalData>,
+        D: Dispatch<CursorShapeManager, GlobalData>,
         D: SeatHandler,
         D: 'static,
     {
-        let global = display.create_global::<D, CursorShapeManager, _>(2, ());
+        let global = display.create_global::<D, CursorShapeManager, _>(2, GlobalData);
         Self { global }
     }
 
@@ -144,38 +157,36 @@ impl CursorShapeManagerState {
     }
 }
 
-impl<D> GlobalDispatch<CursorShapeManager, (), D> for CursorShapeManagerState
+impl<D> GlobalDispatch2<CursorShapeManager, D> for GlobalData
 where
-    D: GlobalDispatch<CursorShapeManager, ()>,
-    D: Dispatch<CursorShapeManager, ()>,
+    D: Dispatch<CursorShapeManager, GlobalData>,
     D: SeatHandler,
     D: 'static,
 {
     fn bind(
+        &self,
         _state: &mut D,
         _handle: &DisplayHandle,
         _client: &wayland_server::Client,
         resource: wayland_server::New<CursorShapeManager>,
-        _global_data: &(),
         data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
-        data_init.init(resource, ());
+        data_init.init(resource, GlobalData);
     }
 }
 
-impl<D> Dispatch<CursorShapeManager, (), D> for CursorShapeManagerState
+impl<D> Dispatch2<CursorShapeManager, D> for GlobalData
 where
-    D: Dispatch<CursorShapeManager, ()>,
     D: Dispatch<CursorShapeDevice, CursorShapeDeviceUserData<D>>,
     D: SeatHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &wayland_server::Client,
         _resource: &CursorShapeManager,
         request: <CursorShapeManager as wayland_server::Resource>::Request,
-        _data: &(),
         _dhandle: &DisplayHandle,
         data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -184,8 +195,7 @@ where
                 cursor_shape_device,
                 pointer,
             } => {
-                let pointer_data = pointer.data::<PointerUserData<D>>();
-                let handle = match pointer_data.and_then(|data| data.handle.as_ref()) {
+                let handle = match PointerHandle::from_resource(&pointer) {
                     Some(handle) => handle,
                     None => return,
                 };
@@ -194,7 +204,7 @@ where
                     .seat_state()
                     .seats
                     .iter()
-                    .find(|seat| seat.get_pointer().map(|h| &h == handle).unwrap_or(false))
+                    .find(|seat| seat.get_pointer().map(|h| h == handle).unwrap_or(false))
                     .cloned()
                 else {
                     return;
@@ -236,20 +246,19 @@ pub(crate) enum CursorShapeDeviceUserDataInner<D: SeatHandler> {
     Tablet(Weak<ZwpTabletToolV2>),
 }
 
-impl<D> Dispatch<CursorShapeDevice, CursorShapeDeviceUserData<D>, D> for CursorShapeManagerState
+impl<D> Dispatch2<CursorShapeDevice, D> for CursorShapeDeviceUserData<D>
 where
-    D: Dispatch<CursorShapeManager, ()>,
-    D: Dispatch<CursorShapeDevice, CursorShapeDeviceUserData<D>>,
     D: SeatHandler + TabletSeatHandler,
     <D as SeatHandler>::PointerFocus: WaylandFocus,
+    <D as TabletSeatHandler>::ToolFocus: WaylandFocus,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &wayland_server::Client,
         resource: &CursorShapeDevice,
         request: <CursorShapeDevice as wayland_server::Resource>::Request,
-        data: &CursorShapeDeviceUserData<D>,
         _dhandle: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -258,7 +267,7 @@ where
                 serial,
                 shape: WEnum::Value(shape),
             } => {
-                match &data.0 {
+                match &self.0 {
                     CursorShapeDeviceUserDataInner::Pointer { seat } => {
                         let Some(seat) = seat.upgrade() else {
                             return;
@@ -282,27 +291,22 @@ where
                             // When the zwp_tablet_tool_v2 is removed, the wp_cursor_shape_device_v1 object becomes inert.
                             return;
                         };
-                        let tablet_data = match tablet.data::<TabletToolUserData>() {
+                        let tablet_data = match tablet.data::<TabletToolUserData<D>>() {
                             Some(data) => data,
                             None => return,
                         };
 
-                        // Check that tablet focus matches.
-                        if !tablet_data
-                            .handle
-                            .inner
-                            .lock()
-                            .unwrap()
-                            .focus
-                            .as_ref()
-                            .map(|focus| focus.same_client_as(&tablet.id()))
-                            .unwrap_or(false)
-                        {
+                        let Some(handle) = tablet_data.handle.upgrade() else {
+                            return;
+                        };
+
+                        if !tablet_tool::allow_setting_cursor(&handle, Serial(serial), &resource.id()) {
                             return;
                         }
 
                         let cursor_icon = shape_to_cursor_icon(shape);
-                        state.tablet_tool_image(&tablet_data.desc, CursorImageStatus::Named(cursor_icon));
+                        state
+                            .tablet_tool_image(&handle.arc.descriptor, CursorImageStatus::Named(cursor_icon));
                     }
                 }
             }
@@ -355,20 +359,4 @@ fn shape_to_cursor_icon(shape: Shape) -> CursorIcon {
         Shape::AllResize => CursorIcon::AllResize,
         _ => CursorIcon::Default,
     }
-}
-
-#[allow(missing_docs)] // TODO
-#[macro_export]
-macro_rules! delegate_cursor_shape {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1: ()
-        ] => $crate::wayland::cursor_shape::CursorShapeManagerState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1: ()
-        ] => $crate::wayland::cursor_shape::CursorShapeManagerState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1: $crate::wayland::cursor_shape::CursorShapeDeviceUserData<$ty>
-        ] => $crate::wayland::cursor_shape::CursorShapeManagerState);
-    };
 }

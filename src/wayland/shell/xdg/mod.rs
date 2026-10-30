@@ -25,7 +25,6 @@
 //! ```no_run
 //! # extern crate wayland_server;
 //! #
-//! use smithay::delegate_xdg_shell;
 //! use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface};
 //! use smithay::wayland::shell::xdg::{XdgShellState, XdgShellHandler, ToplevelSurface, PopupSurface, PositionerState};
 //! use smithay::utils::Serial;
@@ -75,8 +74,15 @@
 //!     }
 //! }
 //!
+//! # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
 //! use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus};
+//! # use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
 //!
+//! # impl CompositorHandler for State {
+//! #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+//! #     fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState { unimplemented!() }
+//! #     fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+//! # }
 //! type Target = wl_surface::WlSurface;
 //! impl SeatHandler for State {
 //!     type KeyboardFocus = Target;
@@ -94,7 +100,9 @@
 //!         // handle new images for the cursor ...
 //!     }
 //! }
-//! delegate_xdg_shell!(State);
+//! # impl PointerConstraintsHandler for State {}
+//!
+//! smithay::delegate_dispatch2!(State);
 //!
 //! // You're now ready to go!
 //! ```
@@ -119,13 +127,16 @@
 //! the [`XdgShellHandler`], or via methods on the [`XdgShellState`].
 
 use crate::utils::alive_tracker::IsAlive;
-use crate::utils::{user_data::UserDataMap, Logical, Point, Rectangle, Size};
-use crate::utils::{Serial, SERIAL_COUNTER};
-use crate::wayland::compositor;
+use crate::utils::{Logical, Point, Rectangle, Size, user_data::UserDataMap};
+use crate::utils::{SERIAL_COUNTER, Serial};
+use crate::wayland::GlobalData;
 use crate::wayland::compositor::Cacheable;
+use crate::wayland::compositor::{self, BufferAssignment, SurfaceAttributes};
+use crate::wayland::shell::xdg::dialog::ToplevelDialogHint;
 use std::cmp::min;
 use std::{collections::HashSet, fmt::Debug, sync::Mutex};
 
+use tracing::{error, trace, trace_span};
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::xdg_positioner::{Anchor, ConstraintAdjustment, Gravity};
 use wayland_protocols::xdg::shell::server::xdg_surface;
@@ -133,8 +144,8 @@ use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_positioner, xdg_toplevel, xdg_wm_base};
 use wayland_server::backend::GlobalId;
 use wayland_server::{
-    protocol::{wl_output, wl_seat, wl_surface},
     DisplayHandle, GlobalDispatch, Resource,
+    protocol::{wl_output, wl_seat, wl_surface},
 };
 
 use super::PingError;
@@ -155,11 +166,13 @@ pub const XDG_POPUP_ROLE: &str = "xdg_popup";
 /// Constant for toplevel state version checking
 const XDG_TOPLEVEL_STATE_TILED_SINCE: u32 = 2;
 const XDG_TOPLEVEL_STATE_SUSPENDED_SINCE: u32 = 6;
+const XDG_TOPLEVEL_STATE_CONSTRAINED_SINCE: u32 = 7;
 
 macro_rules! xdg_role {
     ($state:ty,
      $(#[$configure_meta:meta])* $configure_name:ident $({$($(#[$configure_field_meta:meta])* $configure_field_vis:vis$configure_field_name:ident:$configure_field_type:ty),*}),*,
-     $(#[$attributes_meta:meta])* $attributes_name:ident {$($(#[$attributes_field_meta:meta])* $attributes_field_vis:vis$attributes_field_name:ident:$attributes_field_type:ty),*}) => {
+     $(#[$attributes_meta:meta])* $attributes_name:ident {$($(#[$attributes_field_meta:meta])* $attributes_field_vis:vis$attributes_field_name:ident:$attributes_field_type:ty),*},
+     $(#[$cached_state_meta:meta])* $cached_state_name:ident) => {
 
         $(#[$configure_meta])*
         pub struct $configure_name {
@@ -180,11 +193,6 @@ macro_rules! xdg_role {
 
         $(#[$attributes_meta])*
         pub struct $attributes_name {
-                /// Defines if the surface has received at least one
-                /// xdg_surface.ack_configure from the client
-                pub configured: bool,
-                /// The serial of the last acked configure
-                pub configure_serial: Option<Serial>,
                 /// Holds the state if the surface has sent the initial
                 /// configure event to the client. It is expected that
                 /// during the first commit a initial
@@ -198,17 +206,10 @@ macro_rules! xdg_role {
                 pending_configures: Vec<$configure_name>,
                 /// Holds the pending state as set by the server.
                 pub server_pending: Option<$state>,
-                /// Holds the last server_pending state that has been acknowledged
-                /// by the client. This state should be cloned to the current
-                /// during a commit.
-                pub last_acked: Option<$state>,
-                /// Holds the current state after a successful commit.
-                pub current: $state,
-                /// Holds the last acked configure serial at the time of the last successful
-                /// commit. This serial corresponds to the current state.
-                pub current_serial: Option<Serial>,
-                /// Does the surface have a buffer (updated on every commit)
-                has_buffer: bool,
+                /// Holds the last configure that has been acknowledged by the client. This state
+                /// should be cloned to the current during a commit. Note that this state can be
+                /// newer than the last acked state at the time of the last commit.
+                pub last_acked: Option<$configure_name>,
 
                 $(
                     $(#[$attributes_field_meta])*
@@ -229,14 +230,8 @@ macro_rules! xdg_role {
                     }
                 };
 
-                // Save the state as the last acked state
-                self.last_acked = Some(configure.state.clone());
-
-                // Set the xdg_surface to configured
-                self.configured = true;
-
-                // Save the last configure serial as a reference
-                self.configure_serial = Some(Serial::from(serial));
+                // Save the configure as the last acked configure
+                self.last_acked = Some(configure.clone());
 
                 // Clean old configures
                 self.pending_configures.retain(|c| c.serial > serial);
@@ -255,7 +250,7 @@ macro_rules! xdg_role {
             /// This can be used for example to check if the
             /// [`server_pending`](#structfield.server_pending) state
             /// is different from the last configured.
-            pub fn current_server_state(&self) -> &$state {
+            pub fn current_server_state(&self) -> $state {
                 // We check if there is already a non-acked pending
                 // configure and use its state or otherwise we could
                 // loose some state that was previously configured
@@ -263,17 +258,15 @@ macro_rules! xdg_role {
                 // again. If there is no pending state we try to use the
                 // last acked state which could contain state changes
                 // already acked but not committed to the current state.
-                // In case no last acked state is available, which is
-                // the case on the first configure we fallback to the
-                // current state.
                 // In both cases the state already contains all previous
                 // sent states. This way all pending state is accumulated
                 // into the current state.
                 self.pending_configures
                     .last()
                     .map(|c| &c.state)
-                    .or_else(|| self.last_acked.as_ref())
-                    .unwrap_or(&self.current)
+                    .or_else(|| self.last_acked.as_ref().map(|c| &c.state))
+                    .cloned()
+                    .unwrap_or_default()
             }
 
             /// Check if the state has pending changes that have
@@ -283,7 +276,7 @@ macro_rules! xdg_role {
             /// state is [`Some`] in that it also checks if a current pending
             /// state is different from the [`current_server_state`](#method.current_server_state).
             pub fn has_pending_changes(&self) -> bool {
-                self.server_pending.as_ref().map(|s| s != self.current_server_state()).unwrap_or(false)
+                self.server_pending.as_ref().map(|s| *s != self.current_server_state()).unwrap_or(false)
             }
 
             /// Returns a list of configures sent to, but not yet acknowledged by the client.
@@ -298,20 +291,32 @@ macro_rules! xdg_role {
         impl Default for $attributes_name {
             fn default() -> Self {
                 Self {
-                    configured: false,
-                    configure_serial: None,
                     pending_configures: Vec::new(),
                     initial_configure_sent: false,
                     server_pending: None,
                     last_acked: None,
-                    current: Default::default(),
-                    current_serial: None,
-                    has_buffer: false,
 
                     $(
                         $attributes_field_name: Default::default(),
                     )*
                 }
+            }
+        }
+
+        $(#[$cached_state_meta])*
+        pub struct $cached_state_name {
+            /// Configure last acknowledged by the client at the time of the commit.
+            ///
+            /// Reset to `None` when the surface unmaps.
+            pub last_acked: Option<$configure_name>,
+        }
+
+        impl Cacheable for $cached_state_name {
+            fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+                self.clone()
+            }
+            fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+                *into = self;
             }
         }
     };
@@ -348,12 +353,11 @@ xdg_role!(
         /// should be brought to front. If the parent is focused
         /// all of it's child should be brought to front.
         pub parent: Option<wl_surface::WlSurface>,
-        /// Hints that the dialog has "modal" behavior.
-        /// Modal dialogs typically require to be fully addressed by the user (i.e. closed)
-        /// before resuming interaction with the parent toplevel, and may require a distinct presentation.
+        /// Hint related to the toplevel's "dialog" status.
+        /// See ToplevelDialogHint for more information.
         ///
         /// This value has no effect on toplevels that are not attached to a parent toplevel.
-        pub modal: bool,
+        pub dialog_hint: ToplevelDialogHint,
         /// Holds the optional title the client has set for
         /// this toplevel. For example a web-browser will most likely
         /// set this to include the current uri.
@@ -375,10 +379,13 @@ xdg_role!(
         /// An `zxdg_toplevel_decoration_v1::configure` event has been sent
         /// to the client.
         pub initial_decoration_configure_sent: bool
-    }
+    },
+    /// Represents the xdg_toplevel pending state
+    #[derive(Debug, Default, Clone)]
+    ToplevelCachedState
 );
 
-/// Data associated with XDG toplevel surface  
+/// Data associated with XDG toplevel surface
 ///
 /// ```no_run
 /// use smithay::wayland::compositor;
@@ -441,18 +448,15 @@ xdg_role!(
         /// the xdg_popup role when no parent is set.
         pub parent: Option<wl_surface::WlSurface>,
 
-        /// Defines if the surface has received at least one commit
-        ///
-        /// This can be used to check for protocol errors, like
-        /// checking if a popup requested a grab after it has been
-        /// mapped.
-        pub committed: bool,
-
-        popup_handle: Option<xdg_popup::XdgPopup>
-    }
+        /// If the popup requested a grab, this is the seat and serial.
+        requested_grab: Option<(wl_seat::WlSeat, Serial)>
+    },
+    /// Represents the xdg_popup pending state
+    #[derive(Debug, Default, Clone)]
+    PopupCachedState
 );
 
-/// Data associated with XDG popup surface  
+/// Data associated with XDG popup surface
 ///
 /// ```no_run
 /// use smithay::wayland::compositor;
@@ -941,51 +945,33 @@ impl ToplevelStateSet {
 
     /// Filter the states according to the provided version
     /// of the [`XdgToplevel`]
-    pub(crate) fn into_filtered_states(self, version: u32) -> Vec<xdg_toplevel::State> {
-        let tiled_supported = version >= XDG_TOPLEVEL_STATE_TILED_SINCE;
-        let suspended_supported = version >= XDG_TOPLEVEL_STATE_SUSPENDED_SINCE;
+    pub(crate) fn into_filtered_states(mut self, version: u32) -> Vec<xdg_toplevel::State> {
+        let constrained_supported = version >= XDG_TOPLEVEL_STATE_CONSTRAINED_SINCE;
 
-        // If the client version supports the suspended states
-        // we can directly return the states which will save
-        // us from allocating another vector
-        if suspended_supported {
+        // If constrained is supported, everything is, so we can just return
+        if constrained_supported {
             return self.states;
         }
 
-        let is_suspended = |state: &xdg_toplevel::State| *state == xdg_toplevel::State::Suspended;
-        let contains_suspended = self.states.contains(&xdg_toplevel::State::Suspended);
-
-        // If tiled is supported and there is no suspend state there is nothing to filter out
-        if tiled_supported && !contains_suspended {
-            return self.states;
-        }
-
-        let is_tiled = |state: &xdg_toplevel::State| {
-            matches!(
-                state,
-                xdg_toplevel::State::TiledTop
-                    | xdg_toplevel::State::TiledBottom
-                    | xdg_toplevel::State::TiledLeft
-                    | xdg_toplevel::State::TiledRight
-            )
-        };
-        let contains_tiled = self.states.iter().any(is_tiled);
-
-        // If it does not contain unsupported values
-        if !contains_suspended && !contains_tiled {
-            return self.states;
+        fn version_needed_for_state(state: &xdg_toplevel::State) -> u32 {
+            match state {
+                xdg_toplevel::State::TiledLeft
+                | xdg_toplevel::State::TiledRight
+                | xdg_toplevel::State::TiledTop
+                | xdg_toplevel::State::TiledBottom => XDG_TOPLEVEL_STATE_TILED_SINCE,
+                xdg_toplevel::State::ConstrainedLeft
+                | xdg_toplevel::State::ConstrainedRight
+                | xdg_toplevel::State::ConstrainedTop
+                | xdg_toplevel::State::ConstrainedBottom => XDG_TOPLEVEL_STATE_CONSTRAINED_SINCE,
+                xdg_toplevel::State::Suspended => XDG_TOPLEVEL_STATE_SUSPENDED_SINCE,
+                _ => 1,
+            }
         }
 
         self.states
-            .into_iter()
-            .filter(|state| {
-                if tiled_supported {
-                    !is_suspended(state)
-                } else {
-                    !is_suspended(state) && !is_tiled(state)
-                }
-            })
-            .collect()
+            .retain(|state| version >= version_needed_for_state(state));
+
+        self.states
     }
 }
 
@@ -1194,12 +1180,24 @@ pub trait XdgShellHandler {
     fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32);
 
     /// A shell client was destroyed.
+    ///
+    /// Note: Destruction might happen explicitly by the client, or implicitly
+    /// when the client quits. In case of implicit destruction the order the
+    /// callbacks are called in is undefined.
     fn client_destroyed(&mut self, client: ShellClient) {}
 
     /// A toplevel surface was destroyed.
+    ///
+    /// Note: Destruction might happen explicitly by the client, or implicitly
+    /// when the client quits. In case of implicit destruction the order the
+    /// callbacks are called in is undefined.
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {}
 
     /// A popup surface was destroyed.
+    ///
+    /// Note: Destruction might happen explicitly by the client, or implicitly
+    /// when the client quits. In case of implicit destruction the order the
+    /// callbacks are called in is undefined.
     fn popup_destroyed(&mut self, surface: PopupSurface) {}
 
     /// The toplevel surface set a different app id.
@@ -1228,7 +1226,7 @@ impl XdgShellState {
     /// Create a new `xdg_shell` global with all [`WmCapabilities`](xdg_toplevel::WmCapabilities)
     pub fn new<D>(display: &DisplayHandle) -> XdgShellState
     where
-        D: GlobalDispatch<XdgWmBase, ()> + 'static,
+        D: GlobalDispatch<XdgWmBase, GlobalData> + 'static,
     {
         Self::new_with_capabilities::<D>(
             display,
@@ -1247,9 +1245,9 @@ impl XdgShellState {
         capabilities: impl Into<WmCapabilitySet>,
     ) -> XdgShellState
     where
-        D: GlobalDispatch<XdgWmBase, ()> + 'static,
+        D: GlobalDispatch<XdgWmBase, GlobalData> + 'static,
     {
-        let global = display.create_global::<D, XdgWmBase, _>(6, ());
+        let global = display.create_global::<D, XdgWmBase, _>(7, GlobalData);
 
         XdgShellState {
             known_toplevels: Vec::new(),
@@ -1449,7 +1447,7 @@ impl ToplevelSurface {
                 attributes
                     .server_pending
                     .take()
-                    .unwrap_or_else(|| attributes.current_server_state().clone()),
+                    .unwrap_or_else(|| attributes.current_server_state()),
             );
         }
 
@@ -1503,7 +1501,7 @@ impl ToplevelSurface {
 
                 let pending = self
                     .get_pending_state(&mut attributes)
-                    .unwrap_or_else(|| attributes.current_server_state().clone());
+                    .unwrap_or_else(|| attributes.current_server_state());
                 // retrieve the current state before adding it to the
                 // pending state so that we can compare what has changed
                 let current = attributes.current_server_state();
@@ -1580,96 +1578,98 @@ impl ToplevelSurface {
         })
     }
 
-    /// A newly-unmapped toplevel surface has to perform the initial commit-configure sequence as if it was
-    /// a new toplevel.
-    ///
-    /// This method is used to mark a surface for reinitialization.
-    ///
-    /// NOTE: If you are using smithay's rendering abstractions you don't have to call this manually
-    ///
-    /// Calls [`compositor::with_states`] internally.
-    pub fn reset_initial_configure_sent(&self) {
-        compositor::with_states(&self.wl_surface, |states| {
-            let mut data = states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap();
-            data.initial_configure_sent = false;
-            data.initial_decoration_configure_sent = false;
-        });
-    }
-
-    /// Handles the role specific commit logic
+    /// Handles the role specific commit error checking
     ///
     /// This should be called when the underlying WlSurface
     /// handles a wl_surface.commit request.
-    pub(crate) fn commit_hook<D: 'static>(
-        _state: &mut D,
+    pub(crate) fn pre_commit_hook<D: XdgShellHandler + 'static>(
+        state: &mut D,
         _dh: &DisplayHandle,
         surface: &wl_surface::WlSurface,
     ) {
-        let has_buffer = crate::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
-            state.buffer().is_some()
-        });
+        let _span = trace_span!("xdg-toplevel pre-commit", surface = %surface.id()).entered();
 
-        compositor::with_states(surface, |states| {
-            let mut guard = states
+        let error = compositor::with_states(surface, |states| {
+            let mut role = states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()
                 .unwrap()
                 .lock()
                 .unwrap();
 
-            // This can be None if rendering utils are not used by the user
-            if let Some(has_buffer) = has_buffer {
-                // The surface was mapped in the past, and now got unmapped
-                if guard.has_buffer && !has_buffer {
-                    // After xdg surface unmaps it has to perform the initial commit-configure sequence again
-                    guard.initial_configure_sent = false;
-                    guard.initial_decoration_configure_sent = false;
-                }
+            let mut guard_toplevel = states.cached_state.get::<ToplevelCachedState>();
+            let pending = guard_toplevel.pending();
 
-                guard.has_buffer = has_buffer;
+            // The presence of last_acked always follows the buffer assignment because the
+            // surface is not allowed to attach a buffer without acking the initial configure.
+            let had_buffer_before = pending.last_acked.is_some();
+
+            let mut guard_surface = states.cached_state.get::<SurfaceAttributes>();
+            let has_buffer = match &guard_surface.pending().buffer {
+                Some(BufferAssignment::NewBuffer(_)) => true,
+                Some(BufferAssignment::Removed) => false,
+                None => had_buffer_before,
+            };
+            // Need to check had_buffer_before in case the client attaches a null buffer for the
+            // initial commit---we don't want to consider that as "got unmapped" and reset role.
+            let got_unmapped = had_buffer_before && !has_buffer;
+
+            if has_buffer {
+                let Some(last_acked) = role.last_acked.clone() else {
+                    return Some((
+                        xdg_surface::Error::UnconfiguredBuffer,
+                        "must ack the initial configure before attaching buffer",
+                    ));
+                };
+
+                // The surface remains, or became mapped, track the last acked state.
+                pending.last_acked = Some(last_acked);
+            } else {
+                // The surface remains, or became, unmapped, meaning that it's in the initial
+                // configure stage.
+                pending.last_acked = None;
             }
 
-            if let Some(state) = guard.last_acked.clone() {
-                guard.current = state;
-                guard.current_serial = guard.configure_serial;
-            }
-        });
-    }
+            if got_unmapped {
+                trace!(
+                    "got unmapped; resetting role and cached state; have {} pending configures",
+                    role.pending_configures.len()
+                );
 
-    /// Make sure this surface was configured
-    ///
-    /// Returns `true` if it was, if not, returns `false` and raise
-    /// a protocol error to the associated client. Also returns `false`
-    /// if the surface is already destroyed.
-    ///
-    /// `xdg_shell` mandates that a client acks a configure before committing
-    /// anything.
-    pub fn ensure_configured(&self) -> bool {
-        let configured = compositor::with_states(&self.wl_surface, |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .configured
+                // All attributes are discarded when an xdg_surface is unmapped. Though, we keep
+                // the list of pending configures because there's no way for a surface to tell
+                // an in-flight configure apart from our next initial configure after unmapping.
+                //
+                // This can be reproduced with wleird-unmap if, say, and Activated configure is
+                // timed right.
+                let pending_configures = std::mem::take(&mut role.pending_configures);
+                *role = Default::default();
+                role.pending_configures = pending_configures;
+                *guard_toplevel.pending() = Default::default();
+
+                // Don't forget to prepare the default capabilities though.
+                let default_capabilities = &state.xdg_shell_state().default_capabilities;
+                role.server_pending = Some(Default::default());
+                let current_capabilities = &mut role.server_pending.as_mut().unwrap().capabilities;
+                current_capabilities.replace(default_capabilities.capabilities.iter().copied());
+            }
+
+            None
         });
-        if !configured {
-            let data = self
-                .shell_surface
-                .data::<self::handlers::XdgShellSurfaceUserData>()
-                .unwrap();
-            data.xdg_surface.post_error(
-                xdg_surface::Error::NotConstructed,
-                "Surface has not been configured yet.",
-            );
+
+        if let Some((error, msg)) = error {
+            // The surface attached a buffer without acking the initial configure.
+            let toplevels = &state.xdg_shell_state().known_toplevels;
+            if let Some(toplevel) = toplevels.iter().find(|handle| handle.wl_surface == *surface) {
+                let data = toplevel
+                    .shell_surface
+                    .data::<self::handlers::XdgShellSurfaceUserData>()
+                    .unwrap();
+                data.xdg_surface.post_error(error, msg);
+            } else {
+                error!("surface missing from known toplevels");
+            }
         }
-        configured
     }
 
     /// Send a "close" event to the client
@@ -1707,7 +1707,7 @@ impl ToplevelSurface {
                 .lock()
                 .unwrap();
             if attributes.server_pending.is_none() {
-                attributes.server_pending = Some(attributes.current_server_state().clone());
+                attributes.server_pending = Some(attributes.current_server_state());
             }
 
             let server_pending = attributes.server_pending.as_mut().unwrap();
@@ -1732,18 +1732,25 @@ impl ToplevelSurface {
         })
     }
 
-    /// Gets a copy of the current state of this toplevel
-    pub fn current_state(&self) -> ToplevelState {
+    /// Provides access to the current committed cached state.
+    pub fn with_cached_state<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&ToplevelCachedState) -> T,
+    {
         compositor::with_states(&self.wl_surface, |states| {
-            let attributes = states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap();
-
-            attributes.current.clone()
+            let mut guard = states.cached_state.get::<ToplevelCachedState>();
+            f(guard.current())
         })
+    }
+
+    /// Provides access to the current committed state.
+    ///
+    /// This is the state that the client last acked before making the current commit.
+    pub fn with_committed_state<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(Option<&ToplevelState>) -> T,
+    {
+        self.with_cached_state(move |state| f(state.last_acked.as_ref().map(|c| &c.state)))
     }
 
     /// Returns the parent of this toplevel surface.
@@ -1839,7 +1846,7 @@ impl PopupSurface {
             let pending = attributes
                 .server_pending
                 .take()
-                .unwrap_or_else(|| *attributes.current_server_state());
+                .unwrap_or_else(|| attributes.current_server_state());
 
             let configure = PopupConfigure {
                 state: pending,
@@ -1880,7 +1887,7 @@ impl PopupSurface {
     /// You can manipulate the state that will be sent to the client with the [`with_pending_state`](#method.with_pending_state)
     /// method.
     ///
-    /// Returns [`Err(PopupConfigureError)`] if the initial configure has already been sent and
+    /// Returns `Err(`[`PopupConfigureError`]`)` if the initial configure has already been sent and
     /// the client protocol version disallows a re-configure or the current [`PositionerState`]
     /// is not reactive.
     ///
@@ -1902,7 +1909,12 @@ impl PopupSurface {
                 return Err(PopupConfigureError::AlreadyConfigured);
             }
 
-            let is_reactive = attributes.current.positioner.reactive;
+            let mut cached = states.cached_state.get::<PopupCachedState>();
+            let is_reactive = cached
+                .current()
+                .last_acked
+                .as_ref()
+                .is_some_and(|c| c.state.positioner.reactive);
 
             if attributes.initial_configure_sent && !is_reactive {
                 // Return error, the positioner does not allow re-configure
@@ -1933,26 +1945,6 @@ impl PopupSurface {
         })
     }
 
-    /// A newly-unmapped popup surface has to perform the initial commit-configure sequence as if it was
-    /// a new popup.
-    ///
-    /// This method is used to mark a surface for reinitialization.
-    ///
-    /// NOTE: If you are using smithay's rendering abstractions you don't have to call this manually
-    ///
-    /// Calls [`compositor::with_states`] internally.
-    pub fn reset_initial_configure_sent(&self) {
-        compositor::with_states(&self.wl_surface, |states| {
-            let mut data = states
-                .data_map
-                .get::<XdgPopupSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap();
-            data.initial_configure_sent = false;
-        });
-    }
-
     /// Send a configure event, including the `repositioned` event to the client
     /// in response to a `reposition` request.
     ///
@@ -1965,104 +1957,115 @@ impl PopupSurface {
     ///
     /// This should be called when the underlying WlSurface
     /// handles a wl_surface.commit request.
-    pub(crate) fn pre_commit_hook<D: 'static>(
-        _state: &mut D,
+    pub(crate) fn pre_commit_hook<D: XdgShellHandler + 'static>(
+        state: &mut D,
         _dh: &DisplayHandle,
         surface: &wl_surface::WlSurface,
     ) {
-        let send_error_to = compositor::with_states(surface, |states| {
-            let attributes = states
+        let _span = trace_span!("xdg-popup pre-commit", surface = %surface.id()).entered();
+
+        let res = compositor::with_states(surface, |states| {
+            let mut role = states
                 .data_map
                 .get::<XdgPopupSurfaceData>()
                 .unwrap()
                 .lock()
                 .unwrap();
-            if attributes.parent.is_none() {
-                attributes.popup_handle.clone()
+            if role.parent.is_none() {
+                return Err((
+                    xdg_surface::Error::NotConstructed,
+                    "xdg_popup must have parent before mapping",
+                ));
+            }
+
+            let mut guard_popup = states.cached_state.get::<PopupCachedState>();
+            let pending = guard_popup.pending();
+
+            // The presence of last_acked always follows the buffer assignment because the
+            // surface is not allowed to attach a buffer without acking the initial configure.
+            let had_buffer_before = pending.last_acked.is_some();
+
+            let grab = role.requested_grab.take();
+            if grab.is_some() && had_buffer_before {
+                let popups = &state.xdg_shell_state().known_popups;
+                if let Some(popup) = popups.iter().find(|handle| handle.wl_surface == *surface) {
+                    popup
+                        .shell_surface
+                        .post_error(xdg_popup::Error::InvalidGrab, "tried to grab after being mapped");
+                } else {
+                    error!("surface missing from known popups");
+                }
+                return Ok(None);
+            }
+
+            let mut guard_surface = states.cached_state.get::<SurfaceAttributes>();
+            let has_buffer = match &guard_surface.pending().buffer {
+                Some(BufferAssignment::NewBuffer(_)) => true,
+                Some(BufferAssignment::Removed) => false,
+                None => had_buffer_before,
+            };
+            // Need to check had_buffer_before in case the client attaches a null buffer for the
+            // initial commit---we don't want to consider that as "got unmapped" and reset role.
+            let got_unmapped = had_buffer_before && !has_buffer;
+
+            if has_buffer {
+                let Some(last_acked) = role.last_acked else {
+                    return Err((
+                        xdg_surface::Error::UnconfiguredBuffer,
+                        "must ack the initial configure before attaching buffer",
+                    ));
+                };
+
+                // The surface remains, or became mapped, track the last acked state.
+                pending.last_acked = Some(last_acked);
             } else {
-                None
-            }
-        });
-        if let Some(handle) = send_error_to {
-            let data = handle.data::<self::handlers::XdgShellSurfaceUserData>().unwrap();
-            data.xdg_surface.post_error(
-                xdg_surface::Error::NotConstructed,
-                "Surface has not been configured yet.",
-            );
-        }
-    }
-
-    /// Handles the role specific commit state application
-    ///
-    /// This should be called when the underlying WlSurface
-    /// applies a wl_surface.commit state.
-    pub(crate) fn post_commit_hook<D: 'static>(
-        _state: &mut D,
-        _dh: &DisplayHandle,
-        surface: &wl_surface::WlSurface,
-    ) {
-        let has_buffer = crate::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
-            state.buffer().is_some()
-        });
-
-        compositor::with_states(surface, |states| {
-            let mut attributes = states
-                .data_map
-                .get::<XdgPopupSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap();
-            attributes.committed = true;
-
-            // This can be None if rendering utils are not used by the user
-            if let Some(has_buffer) = has_buffer {
-                // The surface was mapped in the past, and now got unmapped
-                if attributes.has_buffer && !has_buffer {
-                    // After xdg surface unmaps it has to perform the initial commit-configure sequence again
-                    attributes.initial_configure_sent = false;
-                }
-
-                attributes.has_buffer = has_buffer;
+                // The surface remains, or became, unmapped, meaning that it's in the initial
+                // configure stage.
+                pending.last_acked = None;
             }
 
-            if attributes.initial_configure_sent {
-                if let Some(state) = attributes.last_acked {
-                    attributes.current = state;
-                    attributes.current_serial = attributes.configure_serial;
+            if got_unmapped {
+                trace!(
+                    "got unmapped; resetting role and cached state; have {} pending configures",
+                    role.pending_configures.len()
+                );
+
+                // All attributes are discarded when an xdg_surface is unmapped. Though, we keep
+                // the list of pending configures because there's no way for a surface to tell
+                // an in-flight configure apart from our next initial configure after unmapping.
+                let pending_configures = std::mem::take(&mut role.pending_configures);
+                *role = Default::default();
+                role.pending_configures = pending_configures;
+                *guard_popup.pending() = Default::default();
+            }
+
+            Ok(grab)
+        });
+
+        match res {
+            Ok(Some((seat, serial))) => {
+                let popups = &state.xdg_shell_state().known_popups;
+                if let Some(popup) = popups.iter().find(|handle| handle.wl_surface == *surface) {
+                    let popup = popup.clone();
+                    XdgShellHandler::grab(state, popup, seat, serial);
+                } else {
+                    error!("surface missing from known popups");
                 }
             }
-        });
-    }
-
-    /// Make sure this surface was configured
-    ///
-    /// Returns `true` if it was, if not, returns `false` and raise
-    /// a protocol error to the associated client. Also returns `false`
-    /// if the surface is already destroyed.
-    ///
-    /// xdg_shell mandates that a client acks a configure before committing
-    /// anything.
-    pub fn ensure_configured(&self) -> bool {
-        let configured = compositor::with_states(&self.wl_surface, |states| {
-            states
-                .data_map
-                .get::<XdgPopupSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .configured
-        });
-        if !configured {
-            let data = self
-                .shell_surface
-                .data::<self::handlers::XdgShellSurfaceUserData>()
-                .unwrap();
-            data.xdg_surface.post_error(
-                xdg_surface::Error::NotConstructed,
-                "Surface has not been configured yet.",
-            );
+            Ok(None) => (),
+            Err((error, msg)) => {
+                let popups = &state.xdg_shell_state().known_popups;
+                if let Some(popup) = popups.iter().find(|handle| handle.wl_surface == *surface) {
+                    let data = popup
+                        .shell_surface
+                        .data::<self::handlers::XdgShellSurfaceUserData>()
+                        .unwrap();
+                    data.xdg_surface.post_error(error, msg);
+                } else {
+                    error!("surface missing from known popups");
+                }
+            }
         }
-        configured
     }
 
     /// Send a `popup_done` event to the popup surface
@@ -2103,7 +2106,7 @@ impl PopupSurface {
                 .lock()
                 .unwrap();
             if attributes.server_pending.is_none() {
-                attributes.server_pending = Some(*attributes.current_server_state());
+                attributes.server_pending = Some(attributes.current_server_state());
             }
 
             let server_pending = attributes.server_pending.as_mut().unwrap();
@@ -2126,6 +2129,27 @@ impl PopupSurface {
 
             !attributes.initial_configure_sent || attributes.has_pending_changes()
         })
+    }
+
+    /// Provides access to the current committed cached state.
+    pub fn with_cached_state<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&PopupCachedState) -> T,
+    {
+        compositor::with_states(&self.wl_surface, |states| {
+            let mut guard = states.cached_state.get::<PopupCachedState>();
+            f(guard.current())
+        })
+    }
+
+    /// Provides access to the current committed state.
+    ///
+    /// This is the state that the client last acked before making the current commit.
+    pub fn with_committed_state<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(Option<&PopupState>) -> T,
+    {
+        self.with_cached_state(move |state| f(state.last_acked.as_ref().map(|c| &c.state)))
     }
 }
 
@@ -2154,30 +2178,4 @@ impl From<PopupConfigure> for Configure {
     fn from(configure: PopupConfigure) -> Self {
         Configure::Popup(configure)
     }
-}
-
-#[allow(missing_docs)] // TODO
-#[macro_export]
-macro_rules! delegate_xdg_shell {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase: ()
-        ] => $crate::wayland::shell::xdg::XdgShellState);
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase: $crate::wayland::shell::xdg::XdgWmBaseUserData
-        ] => $crate::wayland::shell::xdg::XdgShellState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::XdgPositioner: $crate::wayland::shell::xdg::XdgPositionerUserData
-        ] => $crate::wayland::shell::xdg::XdgShellState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup: $crate::wayland::shell::xdg::XdgShellSurfaceUserData
-        ] => $crate::wayland::shell::xdg::XdgShellState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface: $crate::wayland::shell::xdg::XdgSurfaceUserData
-        ] => $crate::wayland::shell::xdg::XdgShellState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel: $crate::wayland::shell::xdg::XdgShellSurfaceUserData
-        ] => $crate::wayland::shell::xdg::XdgShellState);
-    };
 }

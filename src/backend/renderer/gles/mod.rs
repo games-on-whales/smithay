@@ -1,7 +1,10 @@
 //! Implementation of the rendering traits using OpenGL ES 2
 
-use cgmath::{prelude::*, Matrix3, Vector2};
+// GL calls are all unsafe, so not very helpful in this module.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use core::slice;
+use glam::{Affine2, Mat3, Vec2};
 use std::{
     collections::HashMap,
     ffi::{CStr, CString},
@@ -12,16 +15,17 @@ use std::{
     ptr,
     rc::Rc,
     sync::{
+        Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError,
         atomic::{AtomicBool, AtomicPtr, Ordering},
         mpsc::{self, Sender},
-        Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError,
     },
 };
-use tracing::{debug, error, info, info_span, instrument, span, span::EnteredSpan, trace, warn, Level};
+use tracing::{Level, debug, error, info, info_span, instrument, span, span::EnteredSpan, trace, warn};
 
 pub mod element;
 mod error;
 pub mod format;
+pub mod profiler;
 mod shaders;
 mod texture;
 mod uniform;
@@ -33,23 +37,26 @@ pub use shaders::*;
 pub use texture::*;
 pub use uniform::*;
 
+use crate::{backend::renderer::FrameContext, gpu_span_location};
+use profiler::SpanLocation;
+
 use self::version::GlVersion;
 
 use super::{
-    sync::SyncPoint, Bind, Blit, BlitFrame, Color32F, ContextId, DebugFlags, ExportMem, Frame, ImportDma,
-    ImportMem, Offscreen, Renderer, RendererSuper, Texture, TextureFilter, TextureMapping,
+    Bind, Blit, BlitFrame, Color32F, ContextId, DebugFlags, ExportMem, Frame, ImportDma, ImportMem,
+    Offscreen, Renderer, RendererSuper, Texture, TextureFilter, TextureMapping, sync::SyncPoint,
 };
 use crate::{
     backend::{
         allocator::{
-            dmabuf::{Dmabuf, WeakDmabuf},
-            format::{get_bpp, get_opaque, has_alpha, FormatSet},
             Buffer, Format, Fourcc,
+            dmabuf::{Dmabuf, WeakDmabuf},
+            format::{FormatSet, get_bpp, get_opaque, has_alpha},
         },
         egl::{
+            EGLContext, EGLDevice, EGLSurface, MakeCurrentError,
             fence::EGLFence,
             ffi::egl::{self as ffi_egl, types::EGLImage},
-            EGLContext, EGLSurface, MakeCurrentError,
         },
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -60,7 +67,7 @@ use super::ImportEgl;
 #[cfg(feature = "wayland_frontend")]
 use super::{ImportDmaWl, ImportMemWl};
 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
-use crate::backend::egl::{display::EGLBufferReader, Format as EGLFormat};
+use crate::backend::egl::{Format as EGLFormat, display::EGLBufferReader};
 #[cfg(feature = "wayland_frontend")]
 use crate::wayland::shm::shm_format_to_fourcc;
 #[cfg(feature = "wayland_frontend")]
@@ -113,7 +120,7 @@ struct GlesBuffer(Rc<GlesBufferInner>);
 /// Usually more performant than using a texture as a framebuffer.
 /// Can be read out, but not used like a texture otherwise.
 #[derive(Debug, Clone)]
-pub struct GlesRenderbuffer(Rc<GlesRenderbufferInternal>);
+pub struct GlesRenderbuffer(Arc<GlesRenderbufferInternal>);
 
 #[derive(Debug)]
 struct GlesRenderbufferInternal {
@@ -123,6 +130,8 @@ struct GlesRenderbufferInternal {
     size: Size<i32, BufferCoord>,
     destruction_callback_sender: Sender<CleanupResource>,
 }
+unsafe impl Send for GlesRenderbufferInternal {}
+unsafe impl Sync for GlesRenderbufferInternal {}
 
 impl GlesRenderbuffer {
     /// Size of the renderbuffer
@@ -157,7 +166,7 @@ pub struct GlesTarget<'a>(GlesTargetInternal<'a>);
 enum GlesTargetInternal<'a> {
     Image {
         // TODO: Ideally we would be able to share the texture between renderers with shared EGLContexts though.
-        // But we definitly don't want to add user data to a dmabuf to facilitate this. Maybe use the EGLContexts userdata for storing the buffers?
+        // But we definitely don't want to add user data to a dmabuf to facilitate this. Maybe use the EGLContexts userdata for storing the buffers?
         buf: GlesBuffer,
         dmabuf: &'a mut Dmabuf,
     },
@@ -239,11 +248,9 @@ impl GlesTargetInternal<'_> {
             } else {
                 egl.make_current()?;
                 match self {
-                    GlesTargetInternal::Image { ref buf, .. } => {
-                        gl.BindFramebuffer(ffi::FRAMEBUFFER, buf.0.fbo)
-                    }
-                    GlesTargetInternal::Texture { ref fbo, .. } => gl.BindFramebuffer(ffi::FRAMEBUFFER, *fbo),
-                    GlesTargetInternal::Renderbuffer { ref fbo, .. } => {
+                    GlesTargetInternal::Image { buf, .. } => gl.BindFramebuffer(ffi::FRAMEBUFFER, buf.0.fbo),
+                    GlesTargetInternal::Texture { fbo, .. } => gl.BindFramebuffer(ffi::FRAMEBUFFER, *fbo),
+                    GlesTargetInternal::Renderbuffer { fbo, .. } => {
                         gl.BindFramebuffer(ffi::FRAMEBUFFER, *fbo)
                     }
                     _ => unreachable!(),
@@ -317,7 +324,7 @@ impl Default for GlesCleanup {
 }
 
 impl GlesCleanup {
-    fn cleanup(&self, egl: &EGLContext, gl: &ffi::Gles2) {
+    fn cleanup(&self, egl: &EGLContext, gl: &ffi::Gles2) -> Result<(), MakeCurrentError> {
         let receiver = match self.receiver.try_lock() {
             Ok(receiver) => receiver,
             Err(TryLockError::Poisoned(err)) => {
@@ -326,10 +333,21 @@ impl GlesCleanup {
             }
             Err(TryLockError::WouldBlock) => {
                 // Another thread is running `cleanup`, so just return
-                return;
+                return Ok(());
             }
         };
-        for resource in receiver.try_iter() {
+        let Ok(first) = receiver.try_recv() else {
+            return Ok(());
+        };
+        // Only activate the context once there is something to destroy: activating an idle
+        // GPU's context wakes it from runtime suspend.
+        if !egl.is_current() {
+            if let Err(err) = unsafe { egl.make_current() } {
+                let _ = self.sender.send(first);
+                return Err(err);
+            }
+        }
+        for resource in std::iter::once(first).chain(receiver.try_iter()) {
             match resource {
                 CleanupResource::Texture(texture) => unsafe {
                     gl.DeleteTextures(1, &texture);
@@ -359,6 +377,7 @@ impl GlesCleanup {
                 },
             }
         }
+        Ok(())
     }
 }
 
@@ -378,6 +397,7 @@ pub struct GlesRenderer {
     // optionals
     gl_version: GlVersion,
     pub(crate) extensions: Vec<String>,
+    is_software: bool,
     capabilities: Vec<Capability>,
 
     // shaders
@@ -398,6 +418,9 @@ pub struct GlesRenderer {
     // debug
     span: tracing::Span,
     gl_debug_span: Option<*mut tracing::Span>,
+
+    // profiling
+    profiler: profiler::GpuProfiler,
 }
 
 /// Handle to the currently rendered frame during [`GlesRenderer::render`](Renderer::render).
@@ -410,13 +433,15 @@ pub struct GlesRenderer {
 pub struct GlesFrame<'frame, 'buffer> {
     renderer: &'frame mut GlesRenderer,
     target: &'frame mut GlesTarget<'buffer>,
-    current_projection: Matrix3<f32>,
+    current_projection: Mat3,
     transform: Transform,
     size: Size<i32, Physical>,
     tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
     finished: AtomicBool,
 
     span: EnteredSpan,
+
+    gpu_span: Option<profiler::GpuSpan>,
 }
 
 impl fmt::Debug for GlesFrame<'_, '_> {
@@ -579,6 +604,11 @@ impl GlesRenderer {
 
         context.make_current()?;
 
+        // TODO: check for angle as well?
+        let is_software = EGLDevice::device_for_display(context.display())
+            .map(|dev| dev.is_software())
+            .unwrap_or(false);
+
         let supported_capabilities = Self::supported_capabilities(&context)?;
         let requested_capabilities = capabilities.into_iter().collect::<Vec<_>>();
 
@@ -636,7 +666,7 @@ impl GlesRenderer {
                 version::GLES_2_0
             });
 
-            // required for the manditory wl_shm formats
+            // required for the mandatory wl_shm formats
             if !exts.iter().any(|ext| ext == "GL_EXT_texture_format_BGRA8888") {
                 return Err(GlesError::GLExtensionNotSupported(&[
                     "GL_EXT_texture_format_BGRA8888",
@@ -697,6 +727,8 @@ impl GlesRenderer {
 
         drop(_guard);
 
+        let profiler = profiler::GpuProfiler::new(&gl, &exts);
+
         let renderer = GlesRenderer {
             gl,
             egl: context,
@@ -704,6 +736,7 @@ impl GlesRenderer {
             egl_reader: None,
 
             extensions: exts,
+            is_software,
             gl_version,
             capabilities,
 
@@ -723,6 +756,8 @@ impl GlesRenderer {
             _not_send: PhantomData,
             span,
             gl_debug_span,
+
+            profiler,
         };
         renderer.egl.unbind()?;
         Ok(renderer)
@@ -740,6 +775,11 @@ impl GlesRenderer {
                 sync_lock.wait_for_all(&self.gl);
                 self.gl.GenFramebuffers(1, &mut fbo as *mut _);
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
+
+                // glFramebufferTexture2D only accepts FRAMEBUFFER on GLES 2.0,
+                // READ_FRAMEBUFFER and DRAW_FRAMEBUFFER need GLES 3.0 and higher.
+                // FRAMEBUFFER equals DRAW_FRAMEBUFFER on GLES 3.0, so the extra
+                // READ attach below keeps the blit read path covered.
                 self.gl.FramebufferTexture2D(
                     ffi::FRAMEBUFFER,
                     ffi::COLOR_ATTACHMENT0,
@@ -747,6 +787,17 @@ impl GlesRenderer {
                     texture.0.texture,
                     0,
                 );
+
+                if self.gl_version >= version::GLES_3_0 {
+                    self.gl.FramebufferTexture2D(
+                        ffi::READ_FRAMEBUFFER,
+                        ffi::COLOR_ATTACHMENT0,
+                        ffi::TEXTURE_2D,
+                        texture.0.texture,
+                        0,
+                    );
+                }
+
                 let status = self.gl.CheckFramebufferStatus(ffi::FRAMEBUFFER);
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
 
@@ -777,7 +828,7 @@ impl GlesRenderer {
             self.egl.make_current()?;
         }
         unsafe { self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0) };
-        self.cleanup();
+        self.cleanup()?;
         self.egl.unbind()?;
         Ok(())
     }
@@ -787,15 +838,33 @@ impl GlesRenderer {
     }
 
     #[profiling::function]
-    fn cleanup(&mut self) {
+    fn cleanup(&mut self) -> Result<(), GlesError> {
         self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
         self.buffers.retain(|buffer| !buffer.0.dmabuf.is_gone());
-        self.gles_cleanup().cleanup(&self.egl, &self.gl);
+        self.gles_cleanup().cleanup(&self.egl, &self.gl)?;
+        Ok(())
     }
 
     /// Returns the supported [`Capabilities`](Capability) of this renderer.
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
+    }
+
+    /// Returns whether the underlying EGLContext is known to be a software renderer.
+    pub fn is_software(&self) -> bool {
+        self.is_software
+    }
+
+    fn export_sync_point(&self) -> Option<SyncPoint> {
+        if self.capabilities.contains(&Capability::ExportFence) {
+            if let Ok(fence) = EGLFence::create(self.egl.display()) {
+                unsafe {
+                    self.gl.Flush();
+                }
+                return Some(SyncPoint::from(fence));
+            }
+        }
+        None
     }
 }
 
@@ -917,7 +986,8 @@ impl ImportMemWl for GlesRenderer {
                         ptr.offset(offset as isize) as *const _,
                     );
                 } else {
-                    for region in damage.iter() {
+                    let buffer_rect = Rectangle::from_size(Size::from((width, height)));
+                    for region in damage.iter().filter_map(|r| r.intersection(buffer_rect)) {
                         trace!("Uploading partial shm texture");
                         self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, region.loc.x);
                         self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, region.loc.y);
@@ -1190,7 +1260,7 @@ impl ImportEgl for GlesRenderer {
             format: match egl.format {
                 EGLFormat::RGB | EGLFormat::RGBA => Some(ffi::RGBA8),
                 EGLFormat::External => None,
-                _ => unreachable!("EGLBuffer currenly does not expose multi-planar buffers to us"),
+                _ => unreachable!("EGLBuffer currently does not expose multi-planar buffers to us"),
             },
             has_alpha: !matches!(egl.format, EGLFormat::RGB),
             is_external: egl.format == EGLFormat::External,
@@ -1225,7 +1295,15 @@ impl ImportDma for GlesRenderer {
                 .create_image_from_dmabuf(buffer)
                 .map_err(GlesError::BindBufferEGLError)?;
 
-            let tex = self.import_egl_image(image, is_external, None)?;
+            let tex = match self.import_egl_image(image, is_external, None) {
+                Ok(tex) => tex,
+                Err(err) => {
+                    unsafe {
+                        ffi_egl::DestroyImageKHR(**self.egl.display().get_display_handle(), image);
+                    }
+                    return Err(err);
+                }
+            };
             let format = fourcc_to_gl_formats(buffer.format().code)
                 .map(|(internal, _, _)| internal)
                 .unwrap_or(ffi::RGBA8);
@@ -1321,16 +1399,16 @@ impl ExportMem for GlesRenderer {
 
         let (_, has_alpha) = target.0.format().ok_or(GlesError::UnknownPixelFormat)?;
         let (_, format, layout) = fourcc_to_gl_formats(fourcc).ok_or(GlesError::UnknownPixelFormat)?;
+        let bpp = gl_bpp(format, layout).ok_or(GlesError::UnsupportedPixelLayout)? / 8;
 
         let mut pbo = 0;
         let err = unsafe {
             self.gl.GetError(); // clear errors
             self.gl.GenBuffers(1, &mut pbo);
             self.gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
-            let bpp = gl_bpp(format, layout).ok_or(GlesError::UnsupportedPixelLayout)? / 8;
             let size = (region.size.w * region.size.h * bpp as i32) as isize;
             self.gl
-                .BufferData(ffi::PIXEL_PACK_BUFFER, size, ptr::null(), ffi::STREAM_READ);
+                .BufferData(ffi::PIXEL_PACK_BUFFER, size, ptr::null(), ffi::STREAM_DRAW);
             self.gl
                 .ReadBuffer(if matches!(target.0, GlesTargetInternal::Surface { .. }) {
                     ffi::BACK
@@ -1361,8 +1439,14 @@ impl ExportMem for GlesRenderer {
                 mapping: AtomicPtr::new(ptr::null_mut()),
                 destruction_callback_sender: self.gles_cleanup().sender.clone(),
             }),
-            ffi::INVALID_ENUM | ffi::INVALID_OPERATION => Err(GlesError::UnsupportedPixelFormat(fourcc)),
-            _ => Err(GlesError::UnknownPixelFormat),
+            err => {
+                unsafe { self.gl.DeleteBuffers(1, &pbo) };
+                Err(if matches!(err, ffi::INVALID_ENUM | ffi::INVALID_OPERATION) {
+                    GlesError::UnsupportedPixelFormat(fourcc)
+                } else {
+                    GlesError::UnknownPixelFormat
+                })
+            }
         }
     }
 
@@ -1394,7 +1478,7 @@ impl ExportMem for GlesRenderer {
                 ffi::PIXEL_PACK_BUFFER,
                 (region.size.w * region.size.h * bpp as i32) as isize,
                 ptr::null(),
-                ffi::STREAM_READ,
+                ffi::STREAM_DRAW,
             );
             self.gl.ReadBuffer(ffi::COLOR_ATTACHMENT0);
             self.gl.ReadPixels(
@@ -1421,8 +1505,14 @@ impl ExportMem for GlesRenderer {
                 mapping: AtomicPtr::new(ptr::null_mut()),
                 destruction_callback_sender: self.gles_cleanup().sender.clone(),
             }),
-            ffi::INVALID_ENUM | ffi::INVALID_OPERATION => Err(GlesError::UnsupportedPixelFormat(fourcc)),
-            _ => Err(GlesError::UnknownPixelFormat),
+            err => {
+                unsafe { self.gl.DeleteBuffers(1, &pbo) };
+                Err(if matches!(err, ffi::INVALID_ENUM | ffi::INVALID_OPERATION) {
+                    GlesError::UnsupportedPixelFormat(fourcc)
+                } else {
+                    GlesError::UnknownPixelFormat
+                })
+            }
         }
     }
 
@@ -1472,6 +1562,20 @@ impl Bind<EGLSurface> for GlesRenderer {
 impl Bind<Dmabuf> for GlesRenderer {
     fn bind<'a>(&mut self, dmabuf: &'a mut Dmabuf) -> Result<GlesTarget<'a>, GlesError> {
         let mut bind = |dmabuf: &'a mut Dmabuf| {
+            let texture = self.import_dmabuf(dmabuf, None)?;
+            if texture.0.is_external {
+                return Err(GlesError::FramebufferBindingError);
+            }
+
+            if let Ok(target) = self
+                .bind_texture(&texture)
+                // SAFETY: The lifetime of the target only depends on the dmabuf,
+                // as the GlesTexture is cloned internally.
+                .map(|tex| unsafe { std::mem::transmute::<GlesTarget<'_>, GlesTarget<'a>>(tex) })
+            {
+                return Ok(target);
+            }
+
             let buf = self
                 .buffers
                 .iter_mut()
@@ -1667,7 +1771,7 @@ impl Offscreen<GlesRenderbuffer> for GlesRenderer {
                 .RenderbufferStorage(ffi::RENDERBUFFER, internal, size.w, size.h);
             self.gl.BindRenderbuffer(ffi::RENDERBUFFER, 0);
 
-            Ok(GlesRenderbuffer(Rc::new(GlesRenderbufferInternal {
+            Ok(GlesRenderbuffer(Arc::new(GlesRenderbufferInternal {
                 rbo,
                 format: internal,
                 has_alpha,
@@ -1678,15 +1782,21 @@ impl Offscreen<GlesRenderbuffer> for GlesRenderer {
     }
 }
 
-impl<'buffer> BlitFrame<GlesTarget<'buffer>> for GlesFrame<'_, 'buffer> {
+impl<'buffer> BlitFrame<GlesTarget<'buffer>> for GlesFrame<'_, '_> {
     fn blit_to(
         &mut self,
         to: &mut GlesTarget<'buffer>,
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SyncPoint, Self::Error> {
+        unsafe {
+            self.renderer.gl.Disable(ffi::SCISSOR_TEST);
+        }
         let res = self.renderer.blit(self.target, to, src, dst, filter);
+        unsafe {
+            self.renderer.gl.Enable(ffi::SCISSOR_TEST);
+        }
         self.target
             .0
             .make_current(&self.renderer.gl, &self.renderer.egl)?;
@@ -1699,7 +1809,7 @@ impl<'buffer> BlitFrame<GlesTarget<'buffer>> for GlesFrame<'_, 'buffer> {
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SyncPoint, Self::Error> {
         let res = self.renderer.blit(from, self.target, src, dst, filter);
         self.target
             .0
@@ -1718,7 +1828,7 @@ impl Blit for GlesRenderer {
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
-    ) -> Result<(), GlesError> {
+    ) -> Result<SyncPoint, GlesError> {
         // glBlitFramebuffer is sadly only available for GLES 3.0 and higher
         if self.gl_version < version::GLES_3_0 {
             return Err(GlesError::GLVersionNotSupported(version::GLES_3_0));
@@ -1742,26 +1852,29 @@ impl Blit for GlesRenderer {
             },
         }
 
+        self.profiler.collect(&self.gl);
+        let scope = self.profiler.scope(gpu_span_location!("blit"), &self.gl);
+
         match &src_target.0 {
-            GlesTargetInternal::Image { ref buf, .. } => unsafe {
+            GlesTargetInternal::Image { buf, .. } => unsafe {
                 self.gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, buf.0.fbo)
             },
-            GlesTargetInternal::Texture { ref fbo, .. } => unsafe {
+            GlesTargetInternal::Texture { fbo, .. } => unsafe {
                 self.gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, *fbo)
             },
-            GlesTargetInternal::Renderbuffer { ref fbo, .. } => unsafe {
+            GlesTargetInternal::Renderbuffer { fbo, .. } => unsafe {
                 self.gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, *fbo)
             },
             _ => {} // Note: The only target missing is `Surface` and handled above
         }
         match &dst_target.0 {
-            GlesTargetInternal::Image { ref buf, .. } => unsafe {
+            GlesTargetInternal::Image { buf, .. } => unsafe {
                 self.gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, buf.0.fbo)
             },
-            GlesTargetInternal::Texture { ref fbo, .. } => unsafe {
+            GlesTargetInternal::Texture { fbo, .. } => unsafe {
                 self.gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, *fbo)
             },
-            GlesTargetInternal::Renderbuffer { ref fbo, .. } => unsafe {
+            GlesTargetInternal::Renderbuffer { fbo, .. } => unsafe {
                 self.gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, *fbo)
             },
             _ => {} // Note: The only target missing is `Surface` and handled above
@@ -1769,6 +1882,7 @@ impl Blit for GlesRenderer {
 
         let status = unsafe { self.gl.CheckFramebufferStatus(ffi::FRAMEBUFFER) };
         if status != ffi::FRAMEBUFFER_COMPLETE {
+            drop(scope);
             let _ = self.unbind();
             return Err(GlesError::FramebufferBindingError);
         }
@@ -1792,11 +1906,22 @@ impl Blit for GlesRenderer {
             );
             self.gl.GetError()
         };
+        drop(scope);
 
         if errno == ffi::INVALID_OPERATION {
             Err(GlesError::BlitError)
         } else {
-            Ok(())
+            if let Some(sync_point) = self.export_sync_point() {
+                // Sync after glFlush in export_sync_point() and right before returning.
+                self.profiler.sync_gpu(&self.gl);
+                return Ok(sync_point);
+            }
+            self.profiler.sync_gpu(&self.gl);
+
+            unsafe {
+                self.gl.Finish();
+            }
+            Ok(SyncPoint::signaled())
         }
     }
 }
@@ -1810,6 +1935,8 @@ impl Drop for GlesRenderer {
                 self.gl.DeleteProgram(self.solid_program.program);
                 self.gl.DeleteBuffers(self.vbos.len() as i32, self.vbos.as_ptr());
 
+                self.profiler.cleanup(Some(&self.gl));
+
                 if self.extensions.iter().any(|ext| ext == "GL_KHR_debug") {
                     self.gl.Disable(ffi::DEBUG_OUTPUT);
                     self.gl.DebugMessageCallback(None, ptr::null());
@@ -1818,6 +1945,8 @@ impl Drop for GlesRenderer {
                 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
                 let _ = self.egl_reader.take();
                 let _ = self.egl.unbind();
+            } else {
+                self.profiler.cleanup(None);
             }
 
             if let Some(gl_debug_ptr) = self.gl_debug_span.take() {
@@ -1831,7 +1960,7 @@ impl GlesRenderer {
     /// Get access to the underlying [`EGLContext`].
     ///
     /// *Note*: Modifying the context state, might result in rendering issues.
-    /// The context state is considerd an implementation detail
+    /// The context state is considered an implementation detail
     /// and no guarantee is made about what can or cannot be changed.
     /// To make sure a certain modification does not interfere with
     /// the renderer's behaviour, check the source.
@@ -1856,6 +1985,31 @@ impl GlesRenderer {
             self.egl.make_current()?;
         }
         Ok(func(&self.gl))
+    }
+
+    /// Run custom code in the GL context with GPU profiling.
+    ///
+    /// Sets up a GPU profiling span, calls [`with_context()`](Self::with_context), then finishes
+    /// the span, calls `glFlush()` and synchronizes the CPU/GPU timestamp.
+    pub fn with_profiled_context<F, R>(&mut self, location: SpanLocation, func: F) -> Result<R, GlesError>
+    where
+        F: FnOnce(&ffi::Gles2) -> R,
+    {
+        unsafe {
+            self.egl.make_current()?;
+        }
+
+        self.profiler.collect(&self.gl);
+
+        let result = {
+            let _scope = self.profiler.scope(location, &self.gl);
+            func(&self.gl)
+        };
+
+        unsafe { self.gl.Flush() };
+        self.profiler.sync_gpu(&self.gl);
+
+        Ok(result)
     }
 
     /// Compile a custom pixel shader for rendering with [`GlesFrame::render_pixel_shader_to`].
@@ -2044,6 +2198,28 @@ impl GlesFrame<'_, '_> {
     {
         Ok(func(&self.renderer.gl))
     }
+
+    /// Run custom code in the GL context with GPU profiling.
+    ///
+    /// Calls [`with_context()`](Self::with_context) inside
+    /// [`with_gpu_span()`](Self::with_gpu_span).
+    pub fn with_profiled_context<F, R>(&mut self, location: SpanLocation, func: F) -> Result<R, GlesError>
+    where
+        F: FnOnce(&ffi::Gles2) -> R,
+    {
+        self.with_gpu_span(location, |frame| frame.with_context(func))
+    }
+
+    /// Run a function in a GPU profiling span.
+    pub fn with_gpu_span<F, R>(&mut self, location: SpanLocation, func: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        let span = self.renderer.profiler.enter(location, &self.renderer.gl);
+        let result = func(self);
+        self.renderer.profiler.exit(&self.renderer.gl, span);
+        result
+    }
 }
 
 impl RendererSuper for GlesRenderer {
@@ -2094,6 +2270,11 @@ impl Renderer for GlesRenderer {
     {
         target.0.make_current(&self.gl, &self.egl)?;
 
+        // Collect last frame's timestamps.
+        self.profiler.collect(&self.gl);
+
+        let gpu_span = self.profiler.enter(gpu_span_location!("render"), &self.gl);
+
         unsafe {
             self.gl.Viewport(0, 0, output_size.w, output_size.h);
 
@@ -2111,25 +2292,25 @@ impl Renderer for GlesRenderer {
 
         // replicate https://www.khronos.org/registry/OpenGL-Refpages/gl2.1/xhtml/glOrtho.xml
         // glOrtho(0, width, 0, height, 1, 1);
-        let mut renderer = Matrix3::<f32>::identity();
-        let t = Matrix3::<f32>::identity();
+        let mut renderer = Affine2::IDENTITY;
+        let t = Affine2::IDENTITY;
         let x = 2.0 / (output_size.w as f32);
         let y = 2.0 / (output_size.h as f32);
 
         // Rotation & Reflection
-        renderer[0][0] = x * t[0][0];
-        renderer[1][0] = x * t[0][1];
-        renderer[0][1] = y * -t[1][0];
-        renderer[1][1] = y * -t[1][1];
+        renderer.x_axis.x = x * t.x_axis.x;
+        renderer.y_axis.x = x * t.x_axis.y;
+        renderer.x_axis.y = y * -t.y_axis.x;
+        renderer.y_axis.y = y * -t.y_axis.y;
 
         //Translation
-        renderer[2][0] = -(1.0f32.copysign(renderer[0][0] + renderer[1][0]));
-        renderer[2][1] = -(1.0f32.copysign(renderer[0][1] + renderer[1][1]));
+        renderer.z_axis.x = -(1.0f32.copysign(renderer.x_axis.x + renderer.y_axis.x));
+        renderer.z_axis.y = -(1.0f32.copysign(renderer.x_axis.y + renderer.y_axis.y));
 
         // We account for OpenGLs coordinate system here
-        let flip180 = Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0);
+        let flip180 = Affine2::from_cols_array(&[1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
 
-        let current_projection = flip180 * transform.matrix() * renderer;
+        let current_projection = (flip180 * transform.matrix() * renderer).into();
         let span = span!(parent: &self.span, Level::DEBUG, "renderer_gles2_frame", current_projection = ?current_projection, size = ?output_size, transform = ?transform).entered();
 
         Ok(GlesFrame {
@@ -2143,6 +2324,8 @@ impl Renderer for GlesRenderer {
             finished: AtomicBool::new(false),
 
             span,
+
+            gpu_span: Some(gpu_span),
         })
     }
 
@@ -2183,11 +2366,14 @@ impl Renderer for GlesRenderer {
 
     #[profiling::function]
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
-        unsafe {
-            self.egl.make_current()?;
-        }
-        self.cleanup();
-        Ok(())
+        self.cleanup()
+    }
+
+    #[profiling::function]
+    fn invalidate_caches(&mut self) -> Result<(), Self::Error> {
+        self.dmabuf_cache.clear();
+        self.buffers.clear();
+        self.cleanup()
     }
 }
 
@@ -2261,6 +2447,10 @@ impl Frame for GlesFrame<'_, '_> {
             return Ok(());
         }
 
+        let scope = self
+            .renderer
+            .profiler
+            .enter(gpu_span_location!("clear"), &self.renderer.gl);
         unsafe {
             self.renderer.gl.Disable(ffi::BLEND);
         }
@@ -2271,6 +2461,8 @@ impl Frame for GlesFrame<'_, '_> {
             self.renderer.gl.Enable(ffi::BLEND);
             self.renderer.gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
         }
+        self.renderer.profiler.exit(&self.renderer.gl, scope);
+
         res
     }
 
@@ -2288,6 +2480,10 @@ impl Frame for GlesFrame<'_, '_> {
 
         let is_opaque = color.is_opaque();
 
+        let scope = self
+            .renderer
+            .profiler
+            .enter(gpu_span_location!("draw_solid"), &self.renderer.gl);
         if is_opaque {
             unsafe {
                 self.renderer.gl.Disable(ffi::BLEND);
@@ -2302,6 +2498,7 @@ impl Frame for GlesFrame<'_, '_> {
                 self.renderer.gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
             }
         }
+        self.renderer.profiler.exit(&self.renderer.gl, scope);
 
         res
     }
@@ -2335,6 +2532,10 @@ impl Frame for GlesFrame<'_, '_> {
         self.transform
     }
 
+    fn output_size(&self) -> Size<i32, Physical> {
+        self.size
+    }
+
     #[profiling::function]
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
         self.renderer.wait(sync)
@@ -2355,6 +2556,10 @@ impl GlesFrame<'_, '_> {
             return Ok(SyncPoint::signaled());
         }
 
+        let finish_gpu_span = self
+            .renderer
+            .profiler
+            .enter(gpu_span_location!("finish_internal"), &self.renderer.gl);
         unsafe {
             self.renderer.gl.Disable(ffi::SCISSOR_TEST);
             self.renderer.gl.Disable(ffi::BLEND);
@@ -2365,17 +2570,28 @@ impl GlesFrame<'_, '_> {
         }
 
         // delayed destruction until the next frame rendering.
-        self.renderer.cleanup();
+        {
+            let scope = self
+                .renderer
+                .profiler
+                .enter(gpu_span_location!("cleanup"), &self.renderer.gl);
+            self.renderer.cleanup()?;
+            self.renderer.profiler.exit(&self.renderer.gl, scope);
+        }
+
+        self.renderer.profiler.exit(&self.renderer.gl, finish_gpu_span);
+        if let Some(span) = self.gpu_span.take() {
+            self.renderer.profiler.exit(&self.renderer.gl, span);
+        }
 
         // if we support egl fences we should use it
-        if self.renderer.capabilities.contains(&Capability::ExportFence) {
-            if let Ok(fence) = EGLFence::create(self.renderer.egl.display()) {
-                unsafe {
-                    self.renderer.gl.Flush();
-                }
-                return Ok(SyncPoint::from(fence));
-            }
+        if let Some(sync_point) = self.renderer.export_sync_point() {
+            // Sync after glFlush in export_sync_point() and right before returning.
+            self.renderer.profiler.sync_gpu(&self.renderer.gl);
+            return Ok(sync_point);
         }
+
+        self.renderer.profiler.sync_gpu(&self.renderer.gl);
 
         // as a last option we force finish, this is unlikely to happen
         unsafe {
@@ -2416,7 +2632,7 @@ impl GlesFrame<'_, '_> {
             return Ok(());
         }
 
-        let mut mat = Matrix3::<f32>::identity();
+        let mut mat = Mat3::IDENTITY;
         mat = self.current_projection * mat;
 
         // prepare the vertices
@@ -2461,6 +2677,10 @@ impl GlesFrame<'_, '_> {
         }
 
         let gl = &self.renderer.gl;
+        let _scope = self
+            .renderer
+            .profiler
+            .scope(gpu_span_location!("draw_solid"), &self.renderer.gl);
         unsafe {
             gl.UseProgram(self.renderer.solid_program.program);
             gl.Uniform4f(
@@ -2474,7 +2694,7 @@ impl GlesFrame<'_, '_> {
                 self.renderer.solid_program.uniform_matrix,
                 1,
                 ffi::FALSE,
-                mat.as_ptr(),
+                mat.as_ref().as_ptr(),
             );
 
             gl.EnableVertexAttribArray(self.renderer.solid_program.attrib_vert as u32);
@@ -2508,7 +2728,23 @@ impl GlesFrame<'_, '_> {
 
                 gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len);
             } else {
-                let count = damage_len * 6;
+                // When we have more than 10 rectangles, draw them in batches of 10.
+                for i in 0..(damage_len - 1) / 10 {
+                    gl.DrawArrays(ffi::TRIANGLES, 0, 60);
+
+                    // Set damage pointer to the next 10 rectangles.
+                    gl.VertexAttribPointer(
+                        self.renderer.solid_program.attrib_position as u32,
+                        4,
+                        ffi::FLOAT,
+                        ffi::FALSE,
+                        0,
+                        self.renderer.vertices.as_ptr().add((i + 1) as usize * 60 * 4) as *const _,
+                    );
+                }
+
+                // Draw the up to 10 remaining rectangles.
+                let count = ((damage_len - 1) % 10 + 1) * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count);
             }
 
@@ -2539,12 +2775,12 @@ impl GlesFrame<'_, '_> {
         program: Option<&GlesTexProgram>,
         additional_uniforms: &[Uniform<'_>],
     ) -> Result<(), GlesError> {
-        let mut mat = Matrix3::<f32>::identity();
+        let mut mat = Mat3::IDENTITY;
 
         // dest position and scale
-        mat = mat * Matrix3::from_translation(Vector2::new(dest.loc.x as f32, dest.loc.y as f32));
+        mat *= Mat3::from_translation(Vec2::new(dest.loc.x as f32, dest.loc.y as f32));
 
-        // src scale, position, tranform and y_inverted
+        // src scale, position, transform and y_inverted
         let tex_size = texture.size();
         let src_size = src.size;
 
@@ -2554,7 +2790,7 @@ impl GlesFrame<'_, '_> {
 
         let mut tex_mat = build_texture_mat(src, dest, tex_size, transform);
         if texture.0.y_inverted {
-            tex_mat = Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0) * tex_mat;
+            tex_mat = Mat3::from_cols_array(&[1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 1.0]) * tex_mat;
         }
 
         let render_texture = |renderer: &mut Self, damage: &[Rectangle<i32, Physical>]| {
@@ -2670,8 +2906,8 @@ impl GlesFrame<'_, '_> {
     pub fn render_texture(
         &mut self,
         tex: &GlesTexture,
-        tex_matrix: Matrix3<f32>,
-        mut matrix: Matrix3<f32>,
+        tex_matrix: Mat3,
+        mut matrix: Mat3,
         instances: Option<impl IntoIterator<Item = ffi::types::GLfloat>>,
         alpha: f32,
         program: Option<&GlesTexProgram>,
@@ -2743,6 +2979,10 @@ impl GlesFrame<'_, '_> {
         let sync_lock = tex.0.sync.read().unwrap();
         unsafe {
             sync_lock.wait_for_upload(gl);
+            let scope = self
+                .renderer
+                .profiler
+                .scope(gpu_span_location!("render_texture"), gl);
             gl.ActiveTexture(ffi::TEXTURE0);
             gl.BindTexture(target, tex.0.texture);
             gl.TexParameteri(
@@ -2764,8 +3004,13 @@ impl GlesFrame<'_, '_> {
             gl.UseProgram(program.program);
 
             gl.Uniform1i(program.uniform_tex, 0);
-            gl.UniformMatrix3fv(program.uniform_matrix, 1, ffi::FALSE, matrix.as_ptr());
-            gl.UniformMatrix3fv(program.uniform_tex_matrix, 1, ffi::FALSE, tex_matrix.as_ptr());
+            gl.UniformMatrix3fv(program.uniform_matrix, 1, ffi::FALSE, matrix.as_ref().as_ptr());
+            gl.UniformMatrix3fv(
+                program.uniform_tex_matrix,
+                1,
+                ffi::FALSE,
+                tex_matrix.as_ref().as_ptr(),
+            );
             gl.Uniform1f(program.uniform_alpha, alpha);
 
             if !self.renderer.debug_flags.is_empty() {
@@ -2810,18 +3055,44 @@ impl GlesFrame<'_, '_> {
             );
 
             if self.renderer.capabilities.contains(&Capability::Instancing) {
+                let _scope = self
+                    .renderer
+                    .profiler
+                    .scope(gpu_span_location!("draw instanced"), gl);
                 gl.VertexAttribDivisor(program.attrib_vert as u32, 0);
                 gl.VertexAttribDivisor(program.attrib_vert_position as u32, 1);
 
                 gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len as i32);
             } else {
-                let count = damage_len * 6;
+                let _scope = self
+                    .renderer
+                    .profiler
+                    .scope(gpu_span_location!("draw batched"), gl);
+
+                // When we have more than 10 rectangles, draw them in batches of 10.
+                for i in 0..(damage_len - 1) / 10 {
+                    gl.DrawArrays(ffi::TRIANGLES, 0, 60);
+
+                    // Set damage pointer to the next 10 rectangles.
+                    gl.VertexAttribPointer(
+                        self.renderer.solid_program.attrib_position as u32,
+                        4,
+                        ffi::FLOAT,
+                        ffi::FALSE,
+                        0,
+                        self.renderer.vertices.as_ptr().add((i + 1) * 60 * 4) as *const _,
+                    );
+                }
+
+                // Draw the up to 10 remaining rectangles.
+                let count = ((damage_len - 1) % 10 + 1) * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count as i32);
             }
 
             gl.BindTexture(target, 0);
             gl.DisableVertexAttribArray(program.attrib_vert as u32);
             gl.DisableVertexAttribArray(program.attrib_vert_position as u32);
+            drop(scope);
 
             if self.renderer.capabilities.contains(&Capability::Fencing) {
                 sync_lock.update_read(gl);
@@ -2894,11 +3165,11 @@ impl GlesFrame<'_, '_> {
             return Ok(());
         }
 
-        let mut matrix = Matrix3::<f32>::identity();
+        let mut matrix = Mat3::IDENTITY;
         let tex_matrix = build_texture_mat(src, dest, size, Transform::Normal);
 
         // dest position and scale
-        matrix = matrix * Matrix3::from_translation(Vector2::new(dest.loc.x as f32, dest.loc.y as f32));
+        matrix *= Mat3::from_translation(Vec2::new(dest.loc.x as f32, dest.loc.y as f32));
 
         //apply output transformation
         matrix = self.current_projection * matrix;
@@ -2912,10 +3183,19 @@ impl GlesFrame<'_, '_> {
         // render
         let gl = &self.renderer.gl;
         unsafe {
+            let _scope = self
+                .renderer
+                .profiler
+                .scope(gpu_span_location!("render_pixel_shader_to"), gl);
             gl.UseProgram(program.program);
 
-            gl.UniformMatrix3fv(program.uniform_matrix, 1, ffi::FALSE, matrix.as_ptr());
-            gl.UniformMatrix3fv(program.uniform_tex_matrix, 1, ffi::FALSE, tex_matrix.as_ptr());
+            gl.UniformMatrix3fv(program.uniform_matrix, 1, ffi::FALSE, matrix.as_ref().as_ptr());
+            gl.UniformMatrix3fv(
+                program.uniform_tex_matrix,
+                1,
+                ffi::FALSE,
+                tex_matrix.as_ref().as_ptr(),
+            );
             gl.Uniform2f(program.uniform_size, size.w as f32, size.h as f32);
             gl.Uniform1f(program.uniform_alpha, alpha);
             let tint = if self.renderer.debug_flags.contains(DebugFlags::TINT) {
@@ -2986,7 +3266,7 @@ impl GlesFrame<'_, '_> {
     /// Get access to the underlying [`EGLContext`].
     ///
     /// *Note*: Modifying the context state, might result in rendering issues.
-    /// The context state is considerd an implementation detail
+    /// The context state is considered an implementation detail
     /// and no guarantee is made about what can or cannot be changed.
     /// To make sure a certain modification does not interfere with
     /// the renderer's behaviour, check the source.
@@ -3023,51 +3303,112 @@ fn build_texture_mat(
     dest: Rectangle<i32, Physical>,
     texture: Size<i32, BufferCoord>,
     transform: Transform,
-) -> Matrix3<f32> {
+) -> Mat3 {
     let dst_src_size = transform.transform_size(src.size);
     let scale = dst_src_size.to_f64() / dest.size.to_f64();
 
-    let mut tex_mat = Matrix3::<f32>::identity();
+    let mut tex_mat = Affine2::IDENTITY;
 
     // first bring the damage into src scale
-    tex_mat = Matrix3::from_nonuniform_scale(scale.x as f32, scale.y as f32) * tex_mat;
+    tex_mat = Affine2::from_scale(Vec2::new(scale.x as f32, scale.y as f32)) * tex_mat;
 
     // then compensate for the texture transform
     let transform_mat = transform.matrix();
     let translation = match transform {
-        Transform::Normal => Matrix3::identity(),
-        Transform::_90 => Matrix3::from_translation(Vector2::new(0f32, dst_src_size.w as f32)),
-        Transform::_180 => {
-            Matrix3::from_translation(Vector2::new(dst_src_size.w as f32, dst_src_size.h as f32))
-        }
-        Transform::_270 => Matrix3::from_translation(Vector2::new(dst_src_size.h as f32, 0f32)),
-        Transform::Flipped => Matrix3::from_translation(Vector2::new(dst_src_size.w as f32, 0f32)),
-        Transform::Flipped90 => Matrix3::identity(),
-        Transform::Flipped180 => Matrix3::from_translation(Vector2::new(0f32, dst_src_size.h as f32)),
+        Transform::Normal => Affine2::IDENTITY,
+        Transform::_90 => Affine2::from_translation(Vec2::new(0f32, dst_src_size.w as f32)),
+        Transform::_180 => Affine2::from_translation(Vec2::new(dst_src_size.w as f32, dst_src_size.h as f32)),
+        Transform::_270 => Affine2::from_translation(Vec2::new(dst_src_size.h as f32, 0f32)),
+        Transform::Flipped => Affine2::from_translation(Vec2::new(dst_src_size.w as f32, 0f32)),
+        Transform::Flipped90 => Affine2::IDENTITY,
+        Transform::Flipped180 => Affine2::from_translation(Vec2::new(0f32, dst_src_size.h as f32)),
         Transform::Flipped270 => {
-            Matrix3::from_translation(Vector2::new(dst_src_size.h as f32, dst_src_size.w as f32))
+            Affine2::from_translation(Vec2::new(dst_src_size.h as f32, dst_src_size.w as f32))
         }
     };
     tex_mat = transform_mat * tex_mat;
     tex_mat = translation * tex_mat;
 
     // now we can add the src crop loc, the size already done implicit by the src size
-    tex_mat = Matrix3::from_translation(Vector2::new(src.loc.x as f32, src.loc.y as f32)) * tex_mat;
+    tex_mat = Affine2::from_translation(Vec2::new(src.loc.x as f32, src.loc.y as f32)) * tex_mat;
 
     // at last we have to normalize the values for UV space
-    tex_mat = Matrix3::from_nonuniform_scale(
+    tex_mat = Affine2::from_scale(Vec2::new(
         (1.0f64 / texture.w as f64) as f32,
         (1.0f64 / texture.h as f64) as f32,
-    ) * tex_mat;
+    )) * tex_mat;
 
-    tex_mat
+    tex_mat.into()
+}
+
+/// Guard type wrapping the underlying [`GlesRenderer`] of a [`GlesFrame`].
+#[derive(Debug)]
+pub struct GlesFrameGuard<'a, 'frame, 'buffer> {
+    renderer: &'a mut &'frame mut GlesRenderer,
+    target: &'a mut &'frame mut GlesTarget<'buffer>,
+    old_size: Size<i32, Physical>,
+    old_transform: Transform,
+}
+
+impl AsRef<GlesRenderer> for GlesFrameGuard<'_, '_, '_> {
+    fn as_ref(&self) -> &GlesRenderer {
+        self.renderer
+    }
+}
+
+impl AsMut<GlesRenderer> for GlesFrameGuard<'_, '_, '_> {
+    fn as_mut(&mut self) -> &mut GlesRenderer {
+        self.renderer
+    }
+}
+
+impl<'a, 'frame, 'buffer> FrameContext<'a, 'frame, 'buffer, GlesRenderer> for GlesFrame<'frame, 'buffer>
+where
+    'frame: 'a,
+{
+    type Guard = GlesFrameGuard<'a, 'frame, 'buffer>;
+
+    fn renderer(&'a mut self) -> Self::Guard {
+        GlesFrameGuard {
+            renderer: &mut self.renderer,
+            target: &mut self.target,
+            old_size: self.size,
+            old_transform: self.transform,
+        }
+    }
+}
+
+impl Drop for GlesFrameGuard<'_, '_, '_> {
+    fn drop(&mut self) {
+        if let Err(err) = self.target.0.make_current(&self.renderer.gl, &self.renderer.egl) {
+            warn!(?err, "Failed to restore previous render target");
+            return;
+        }
+
+        let mut output_size = self.old_size;
+        if let Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 =
+            self.old_transform
+        {
+            mem::swap(&mut output_size.w, &mut output_size.h);
+        }
+
+        unsafe {
+            self.renderer.gl.Viewport(0, 0, output_size.w, output_size.h);
+
+            self.renderer.gl.Scissor(0, 0, output_size.w, output_size.h);
+            self.renderer.gl.Enable(ffi::SCISSOR_TEST);
+
+            self.renderer.gl.Enable(ffi::BLEND);
+            self.renderer.gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::build_texture_mat;
     use crate::utils::{Buffer, Physical, Rectangle, Size, Transform};
-    use cgmath::Vector3;
+    use glam::Vec3;
 
     #[test]
     fn texture_normal_double_size() {
@@ -3078,15 +3419,15 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(0f32, 0f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(1f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(1f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(0f32, 1f32, 1f32));
     }
 
     #[test]
@@ -3098,26 +3439,20 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(
-            tex_mat * top_left,
-            Vector3::new(0.05047506f32, 0.07492582f32, 1f32)
-        );
-        assert_eq!(
-            tex_mat * top_right,
-            Vector3::new(0.1811164f32, 0.07492582f32, 1f32)
-        );
+        assert_eq!(tex_mat * top_left, Vec3::new(0.05047506f32, 0.07492582f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(0.1811164f32, 0.07492582f32, 1f32));
         assert_eq!(
             tex_mat * bottom_right,
-            Vector3::new(0.1811164f32, 0.30341247f32, 1f32)
+            Vec3::new(0.1811164f32, 0.30341247f32, 1f32)
         );
         assert_eq!(
             tex_mat * bottom_left,
-            Vector3::new(0.05047506f32, 0.30341247f32, 1f32)
+            Vec3::new(0.05047506f32, 0.30341247f32, 1f32)
         );
     }
 
@@ -3130,15 +3465,15 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(0f32, 0f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(1f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(1f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(0f32, 1f32, 1f32));
     }
 
     #[test]
@@ -3150,15 +3485,15 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(1f32, 0f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(0f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(0f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(1f32, 1f32, 1f32));
     }
 
     #[test]
@@ -3170,15 +3505,15 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(0f32, 1f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(0f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(1f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(1f32, 1f32, 1f32));
     }
 
     #[test]
@@ -3190,15 +3525,15 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(1f32, 1f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(0f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(0f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(1f32, 0f32, 1f32));
     }
 
     #[test]
@@ -3210,15 +3545,15 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(1f32, 0f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(1f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(0f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(0f32, 0f32, 1f32));
     }
 
     #[test]
@@ -3230,15 +3565,15 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(0f32, 0f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(0f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(1f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(1f32, 0f32, 1f32));
     }
 
     #[test]
@@ -3250,15 +3585,15 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(0f32, 1f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(1f32, 1f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(1f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(0f32, 0f32, 1f32));
     }
 
     #[test]
@@ -3270,14 +3605,70 @@ mod tests {
 
         let tex_mat = build_texture_mat(src, dest, texture_size, transform);
 
-        let top_left = Vector3::new(0f32, 0f32, 1f32);
-        let top_right = Vector3::new(dest.size.w as f32, 0f32, 1f32);
-        let bottom_right = Vector3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
-        let bottom_left = Vector3::new(0f32, dest.size.h as f32, 1f32);
+        let top_left = Vec3::new(0f32, 0f32, 1f32);
+        let top_right = Vec3::new(dest.size.w as f32, 0f32, 1f32);
+        let bottom_right = Vec3::new(dest.size.w as f32, dest.size.h as f32, 1f32);
+        let bottom_left = Vec3::new(0f32, dest.size.h as f32, 1f32);
 
-        assert_eq!(tex_mat * top_left, Vector3::new(1f32, 1f32, 1f32));
-        assert_eq!(tex_mat * top_right, Vector3::new(1f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_right, Vector3::new(0f32, 0f32, 1f32));
-        assert_eq!(tex_mat * bottom_left, Vector3::new(0f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_left, Vec3::new(1f32, 1f32, 1f32));
+        assert_eq!(tex_mat * top_right, Vec3::new(1f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_right, Vec3::new(0f32, 0f32, 1f32));
+        assert_eq!(tex_mat * bottom_left, Vec3::new(0f32, 1f32, 1f32));
+    }
+}
+
+#[cfg(test)]
+mod context_activation_tests {
+    use super::*;
+    use crate::backend::egl::EGLDisplay;
+
+    // Prefer software rendering so the tests can run without a GPU: Mesa offers a software
+    // device even on a machine with no DRM node.
+    fn test_renderer() -> GlesRenderer {
+        let mut devices = EGLDevice::enumerate()
+            .expect("EGL device enumeration failed; Mesa provides the software device these tests need")
+            .collect::<Vec<_>>();
+        devices.sort_by_key(|device| !device.is_software());
+        devices
+            .into_iter()
+            .find_map(|device| {
+                let display = unsafe { EGLDisplay::new(device) }.ok()?;
+                let context = EGLContext::new(&display).ok()?;
+                unsafe { GlesRenderer::new(context) }.ok()
+            })
+            .expect("no usable EGL device; Mesa provides the software device these tests need")
+    }
+
+    fn drain_and_unbind(renderer: &mut GlesRenderer) {
+        renderer.cleanup_texture_cache().unwrap();
+        renderer.egl_context().unbind().unwrap();
+        assert!(!renderer.egl_context().is_current());
+    }
+
+    #[test]
+    fn cleanup_texture_cache_leaves_an_idle_context_unbound() {
+        let mut renderer = test_renderer();
+        drain_and_unbind(&mut renderer);
+
+        renderer.cleanup_texture_cache().unwrap();
+
+        assert!(!renderer.egl_context().is_current());
+    }
+
+    #[test]
+    fn cleanup_texture_cache_frees_a_dropped_texture_from_an_unbound_context() {
+        let mut renderer = test_renderer();
+        let texture = renderer
+            .import_memory(&[0u8; 4], Fourcc::Argb8888, Size::from((1, 1)), false)
+            .unwrap();
+        let texture_id = texture.tex_id();
+        assert_eq!(unsafe { renderer.gl.IsTexture(texture_id) }, ffi::TRUE);
+        drain_and_unbind(&mut renderer);
+        drop(texture);
+
+        renderer.cleanup_texture_cache().unwrap();
+
+        unsafe { renderer.egl_context().make_current().unwrap() };
+        assert_eq!(unsafe { renderer.gl.IsTexture(texture_id) }, ffi::FALSE);
     }
 }

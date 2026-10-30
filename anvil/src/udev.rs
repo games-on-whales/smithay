@@ -5,7 +5,7 @@ use std::{
     io,
     ops::Not,
     path::Path,
-    sync::{atomic::Ordering, Mutex, Once},
+    sync::{Mutex, Once, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,7 @@ use crate::{
     drawing::*,
     render::*,
     shell::WindowElement,
-    state::{take_presentation_feedback, update_primary_scanout_output, AnvilState, Backend},
+    state::{AnvilState, Backend, take_presentation_feedback, update_primary_scanout_output},
 };
 use crate::{
     shell::WindowRenderElement,
@@ -24,40 +24,39 @@ use smithay::backend::drm::compositor::PrimaryPlaneElement;
 #[cfg(feature = "egl")]
 use smithay::backend::renderer::ImportEgl;
 #[cfg(feature = "debug")]
-use smithay::backend::renderer::{multigpu::MultiTexture, ImportMem};
+use smithay::backend::renderer::{ImportMem, multigpu::MultiTexture};
 use smithay::{
     backend::{
+        SwapBuffersError,
         allocator::{
+            Fourcc, Modifier,
             dmabuf::Dmabuf,
             format::FormatSet,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
-            Fourcc, Modifier,
         },
         drm::{
+            CreateDrmNodeError, DrmAccessError, DrmDevice, DrmDeviceFd, DrmError, DrmEvent, DrmEventMetadata,
+            DrmEventTime, DrmNode, DrmSurface, GbmBufferedSurface, NodeType,
             compositor::{DrmCompositor, FrameFlags},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
-            CreateDrmNodeError, DrmAccessError, DrmDevice, DrmDeviceFd, DrmError, DrmEvent, DrmEventMetadata,
-            DrmEventTime, DrmNode, DrmSurface, GbmBufferedSurface, NodeType,
         },
-        egl::{self, context::ContextPriority, EGLDevice, EGLDisplay},
+        egl::{self, EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            damage::Error as OutputDamageTrackerError,
-            element::{memory::MemoryRenderBuffer, AsRenderElements, RenderElementStates},
-            gles::GlesRenderer,
-            multigpu::{gbm::GbmGlesBackend, GpuManager, MultiRenderer},
             DebugFlags, ImportDma, ImportMemWl,
+            damage::Error as OutputDamageTrackerError,
+            element::{AsRenderElements, RenderElementStates, memory::MemoryRenderBuffer},
+            gles::{Capability, GlesRenderer},
+            multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
         },
         session::{
-            libseat::{self, LibSeatSession},
             Event as SessionEvent, Session,
+            libseat::{self, LibSeatSession},
         },
-        udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent},
-        SwapBuffersError,
+        udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu},
     },
-    delegate_dmabuf, delegate_drm_lease,
     desktop::{
         space::{Space, SurfaceTree},
         utils::OutputPresentationFeedback,
@@ -69,12 +68,12 @@ use smithay::{
     output::{Mode as WlMode, Output, PhysicalProperties},
     reexports::{
         calloop::{
-            timer::{TimeoutAction, Timer},
             EventLoop, RegistrationToken,
+            timer::{TimeoutAction, Timer},
         },
         drm::{
-            control::{connector, crtc, Device, ModeTypeFlags},
             Device as _,
+            control::{Device, ModeTypeFlags, connector, crtc},
         },
         input::{DeviceCapability, Libinput},
         rustix::fs::OFlags,
@@ -82,7 +81,7 @@ use smithay::{
             linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
             presentation_time::server::wp_presentation_feedback,
         },
-        wayland_server::{backend::GlobalId, protocol::wl_surface, Display, DisplayHandle},
+        wayland_server::{Display, DisplayHandle, backend::GlobalId, protocol::wl_surface},
     },
     utils::{DeviceFd, IsAlive, Logical, Monotonic, Point, Scale, Time, Transform},
     wayland::{
@@ -91,7 +90,7 @@ use smithay::{
         drm_lease::{
             DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
         },
-        drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjHandler, DrmSyncobjState},
+        drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState, supports_syncobj_eventfd},
         presentation::Refresh,
     },
 };
@@ -150,8 +149,8 @@ impl UdevData {
         if self.debug_flags != flags {
             self.debug_flags = flags;
 
-            for (_, backend) in self.backends.iter_mut() {
-                for (_, surface) in backend.surfaces.iter_mut() {
+            for backend in self.backends.values_mut() {
+                for surface in backend.surfaces.values_mut() {
                     surface.drm_output.set_debug_flags(flags);
                 }
             }
@@ -176,14 +175,15 @@ impl DmabufHandler for AnvilState<UdevData> {
             .and_then(|mut renderer| renderer.import_dmabuf(&dmabuf, None))
             .is_ok()
         {
-            dmabuf.set_node(self.backend_data.primary_gpu);
+            if dmabuf.node().is_none() {
+                dmabuf.set_node(self.backend_data.primary_gpu);
+            }
             let _ = notifier.successful::<AnvilState<UdevData>>();
         } else {
             notifier.failed();
         }
     }
 }
-delegate_dmabuf!(AnvilState<UdevData>);
 
 impl Backend for UdevData {
     const HAS_RELATIVE_MOTION: bool = true;
@@ -251,7 +251,15 @@ pub fn run_udev() {
     };
     info!("Using {} as primary gpu.", primary_gpu);
 
-    let gpus = GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High)).unwrap();
+    let gpus = GpuManager::new(GbmGlesBackend::with_factory(|display| {
+        let context = EGLContext::new_with_priority(display, ContextPriority::RealTime)?;
+        let mut capabilities = unsafe { GlesRenderer::supported_capabilities(&context)? };
+        if std::env::var("ANVIL_GLES_DISABLE_INSTANCING").is_ok() {
+            capabilities.retain(|capability| *capability != Capability::Instancing);
+        }
+        Ok(unsafe { GlesRenderer::with_capabilities(context, capabilities)? })
+    }))
+    .unwrap();
 
     let data = UdevData {
         dh: display_handle.clone(),
@@ -519,6 +527,9 @@ pub fn run_udev() {
     #[cfg(feature = "xwayland")]
     state.start_xwayland();
 
+    #[cfg(feature = "libei")]
+    crate::libei::listen_eis(&event_loop.handle());
+
     /*
      * And run our loop
      */
@@ -605,14 +616,11 @@ impl DrmLeaseHandler for AnvilState<UdevData> {
     }
 }
 
-delegate_drm_lease!(AnvilState<UdevData>);
-
 impl DrmSyncobjHandler for AnvilState<UdevData> {
     fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
         self.backend_data.syncobj_state.as_mut()
     }
 }
-smithay::delegate_drm_syncobj!(AnvilState<UdevData>);
 
 pub type RenderSurface = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, Option<OutputPresentationFeedback>>;
 
@@ -728,7 +736,12 @@ fn get_surface_dmabuf_feedback(
     let render_feedback = if let Some(render_node) = render_node {
         builder
             .clone()
-            .add_preference_tranche(render_node.dev_id(), None, render_formats.clone())
+            .add_preference_tranche(
+                render_node.dev_id(),
+                zwp_linux_dmabuf_feedback_v1::TrancheFlags::Sampling,
+                render_formats.clone(),
+                3u32..=6,
+            )
             .build()
             .unwrap()
     } else {
@@ -738,10 +751,16 @@ fn get_surface_dmabuf_feedback(
     let scanout_feedback = builder
         .add_preference_tranche(
             surface.device_fd().dev_id().unwrap(),
-            Some(zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout),
+            zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
             planes_formats,
+            4u32..=6,
         )
-        .add_preference_tranche(scanout_node.dev_id(), None, render_formats)
+        .add_preference_tranche(
+            scanout_node.dev_id(),
+            zwp_linux_dmabuf_feedback_v1::TrancheFlags::Sampling,
+            render_formats,
+            4u32..=6,
+        )
         .build()
         .unwrap();
 
@@ -922,6 +941,11 @@ impl AnvilState<UdevData> {
             .and_then(|info| info.model())
             .unwrap_or_else(|| "Unknown".into());
 
+        let serial_number = display_info
+            .as_ref()
+            .and_then(|info| info.serial())
+            .unwrap_or_else(|| "Unknown".into());
+
         if non_desktop {
             info!("Connector {} is non-desktop, setting up for leasing", output_name);
             device.non_desktop_connectors.push((connector.handle(), crtc));
@@ -950,6 +974,7 @@ impl AnvilState<UdevData> {
                     subpixel: connector.subpixel().into(),
                     make,
                     model,
+                    serial_number,
                 },
             );
             let global = output.create_global::<AnvilState<UdevData>>(&self.display_handle);
@@ -1124,6 +1149,10 @@ impl AnvilState<UdevData> {
                 } => {
                     self.connector_disconnected(node, connector, crtc);
                 }
+                // The connector's mode list changed while it stayed connected (e.g. EDID
+                // arrived after the initial probe returned empty/fallback modes). Compositors
+                // should re-evaluate the output's mode selection and recreate the surface here.
+                DrmScanEvent::Changed { .. } => {}
                 _ => {}
             }
         }
@@ -1335,15 +1364,14 @@ impl AnvilState<UdevData> {
                 .unwrap_or(true)
             {
                 // However, if we need to do a copy, that might not be enough.
-                // (And without actual comparision to previous frames we cannot really know.)
+                // (And without actual comparison to previous frames we cannot really know.)
                 // So lets ignore that in those cases to avoid thrashing performance.
                 trace!("scheduling repaint timer immediately on {:?}", crtc);
                 Timer::immediate()
             } else {
                 trace!(
                     "scheduling repaint timer with delay {:?} on {:?}",
-                    repaint_delay,
-                    crtc
+                    repaint_delay, crtc
                 );
                 Timer::from_duration(repaint_delay)
             };
@@ -1511,8 +1539,7 @@ impl AnvilState<UdevData> {
                 Duration::from(next_frame_target).saturating_sub(self.clock.now().into());
             trace!(
                 "reschedule repaint timer with delay {:?} on {:?}",
-                reschedule_timeout,
-                crtc,
+                reschedule_timeout, crtc,
             );
             let timer = Timer::from_duration(reschedule_timeout);
             self.handle
@@ -1550,7 +1577,7 @@ fn render_surface<'a>(
     let mut custom_elements: Vec<CustomRenderElements<_>> = Vec::new();
 
     if output_geometry.to_f64().contains(pointer_location) {
-        let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = cursor_status {
+        let cursor_hotspot = if let CursorImageStatus::Surface(surface) = cursor_status {
             compositor::with_states(surface, |states| {
                 states
                     .data_map

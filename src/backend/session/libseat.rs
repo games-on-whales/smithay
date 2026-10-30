@@ -11,21 +11,21 @@ use std::{
     path::Path,
     rc::{Rc, Weak},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use rustix::{fs::OFlags, io::Errno};
 
 use calloop::{
-    channel::{self, Channel},
     EventSource, Poll, PostAction, Readiness, Token, TokenFactory,
+    channel::{self, Channel},
 };
 
 use crate::backend::session::{AsErrno, Event as SessionEvent, Session};
 
-use tracing::{debug, error, info_span, instrument};
+use tracing::{debug, info_span, instrument};
 
 #[derive(Debug)]
 struct LibSeatSessionImpl {
@@ -81,7 +81,7 @@ impl LibSeatSession {
         seat.map(|mut seat| {
             let seat_name = seat.name().to_owned();
 
-            // In some cases enable_seat event is avalible right after startup
+            // In some cases enable_seat event is available right after startup
             // so, we can dispatch it
             seat.dispatch(0).unwrap();
             let active = matches!(rx.try_recv(), Ok(SeatEvent::Enable));
@@ -142,7 +142,7 @@ impl Session for LibSeatSession {
         if let Some(session) = self.internal.upgrade() {
             debug!("Closing device: {:?}", fd);
 
-            let out = if let Some(dev) = session.devices.borrow_mut().remove(&fd.as_fd().as_raw_fd()) {
+            if let Some(dev) = session.devices.borrow_mut().remove(&fd.as_fd().as_raw_fd()) {
                 session
                     .seat
                     .borrow_mut()
@@ -150,11 +150,8 @@ impl Session for LibSeatSession {
                     .map_err(|err| Error::FailedToCloseDevice(Errno::from_raw_os_error(err.into())))
             } else {
                 Ok(())
-            };
-
+            }
             // `fd` is closed on drop
-
-            out
         } else {
             Err(Error::SessionLost)
         }

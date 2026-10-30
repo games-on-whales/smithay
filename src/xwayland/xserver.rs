@@ -18,7 +18,7 @@ use wayland_server::{Client, DisplayHandle};
 
 use crate::{utils::user_data::UserDataMap, wayland::compositor::CompositorClientState};
 
-use super::x11_sockets::{prepare_x11_sockets, X11Lock};
+use super::x11_sockets::{X11Lock, prepare_x11_sockets};
 
 /// A handle to a running XWayland process. Using XWayland as an xserver for
 /// X11-based clients requires two connections: one wayland socket, where
@@ -89,12 +89,18 @@ impl XWayland {
     /// Spawns an XWayland server instance. `Xwayland` must be on the `PATH` and
     /// executable.
     ///
+    /// `Xwayland` starts with only `PATH` and `XDG_RUNTIME_DIR` from the
+    /// compositor's environment, plus `envs`. To pass the whole environment
+    /// instead, use [`spawn_with_inherited_env`](Self::spawn_with_inherited_env).
+    ///
     /// ## Arguments
     ///
     /// - `display` - if provided, only the given display number will be tested.
     ///   If you wish smithay to choose a display for you, pass `None`.
     /// - `envs` - Allows additionally environment variables to be set when
     ///   launching XWayland.
+    /// - `extra_args` - Additional command-line arguments to pass to Xwayland
+    ///   (e.g. `-enable-ei-portal`).
     /// - `open_abstract_socket` - Open an abstract socket as well as filesystem
     ///   sockets (only on available on Linux).
     /// - `stdout, stderr` - Allows redirecting stdout and stderr of the
@@ -109,10 +115,12 @@ impl XWayland {
     /// handle can be inserted in your event loop, and If everything goes well,
     /// you'll eventually receive an `XWaylandEvent::Ready`, indicating that
     /// it's time to start the X11 window manager.
-    pub fn spawn<K, V, I, F>(
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn<K, V, I, A, AI, F>(
         dh: &DisplayHandle,
         display: impl Into<Option<u32>>,
         envs: I,
+        extra_args: AI,
         open_abstract_socket: bool,
         stdout: impl Into<std::process::Stdio>,
         stderr: impl Into<std::process::Stdio>,
@@ -122,6 +130,85 @@ impl XWayland {
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
+        AI: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
+        Self::spawn_inner(
+            dh,
+            display,
+            envs,
+            extra_args,
+            open_abstract_socket,
+            stdout,
+            stderr,
+            user_data,
+            true,
+        )
+    }
+
+    /// Spawns an `Xwayland` server instance that inherits the compositor's
+    /// whole environment. `Xwayland` must be on the `PATH` and executable.
+    /// Use it when `Xwayland` needs variables that [`spawn`](Self::spawn) drops.
+    ///
+    /// `WAYLAND_SOCKET` is always replaced, and `envs` is applied last, so it
+    /// can override inherited variables. The arguments and return value are
+    /// the same as for [`spawn`](Self::spawn).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the X11 sockets cannot be set up, `Xwayland` cannot
+    /// be started, or its client cannot be added to the display.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_inherited_env<K, V, I, A, AI, F>(
+        dh: &DisplayHandle,
+        display: impl Into<Option<u32>>,
+        envs: I,
+        extra_args: AI,
+        open_abstract_socket: bool,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        AI: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
+        Self::spawn_inner(
+            dh,
+            display,
+            envs,
+            extra_args,
+            open_abstract_socket,
+            stdout,
+            stderr,
+            user_data,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner<K, V, I, A, AI, F>(
+        dh: &DisplayHandle,
+        display: impl Into<Option<u32>>,
+        envs: I,
+        extra_args: AI,
+        open_abstract_socket: bool,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+        clear_env: bool,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        AI: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
         F: FnOnce(&UserDataMap),
     {
         let (x_wm_x11, x_wm_me) = UnixStream::pair()?;
@@ -152,12 +239,17 @@ impl XWayland {
             command.arg("-listenfd").arg(socket.as_raw_fd().to_string());
         }
 
-        // Setup the environment; clear everything except PATH and XDG_RUNTIME_DIR.
-        command.env_clear();
-        for (key, value) in env::vars_os() {
-            if key.to_str() == Some("PATH") || key.to_str() == Some("XDG_RUNTIME_DIR") {
-                command.env(key, value);
-                continue;
+        for arg in extra_args {
+            command.arg(arg);
+        }
+
+        if clear_env {
+            // Setup the environment; clear everything except PATH and XDG_RUNTIME_DIR.
+            command.env_clear();
+            for (key, value) in env::vars_os() {
+                if key.to_str() == Some("PATH") || key.to_str() == Some("XDG_RUNTIME_DIR") {
+                    command.env(key, value);
+                }
             }
         }
 
@@ -396,7 +488,7 @@ impl XWaylandClientData {
 /// Removes the `O_CLOEXEC` flag from a `RawFd`, causing it to leak when we
 /// `exec` XWayland
 unsafe fn unset_cloexec(fd: RawFd) -> std::io::Result<()> {
-    let fd = BorrowedFd::borrow_raw(fd);
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())?;
     Ok(())
 }

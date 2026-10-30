@@ -3,41 +3,51 @@ use std::sync::atomic::Ordering;
 use crate::{
     utils::Serial,
     wayland::{
-        compositor,
-        shell::{is_valid_parent, xdg::XdgToplevelSurfaceData},
+        Dispatch2, compositor,
+        shell::{
+            is_valid_parent,
+            xdg::{ToplevelCachedState, XdgToplevelSurfaceData},
+        },
     },
 };
 
-use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, XdgToplevel};
-
-use wayland_server::{
-    backend::ClientId, protocol::wl_surface, DataInit, Dispatch, DisplayHandle, Resource, WEnum,
+use wayland_protocols::xdg::{
+    decoration::zv1::server::zxdg_toplevel_decoration_v1,
+    shell::server::xdg_toplevel::{self, XdgToplevel},
 };
+
+use wayland_server::{DataInit, DisplayHandle, Resource, WEnum, backend::ClientId, protocol::wl_surface};
 
 use super::{
-    SurfaceCachedState, ToplevelConfigure, XdgShellHandler, XdgShellState, XdgShellSurfaceUserData,
-    XdgSurfaceUserData, XdgToplevelSurfaceRoleAttributes,
+    SurfaceCachedState, ToplevelConfigure, XdgShellHandler, XdgShellSurfaceUserData, XdgSurfaceUserData,
+    XdgToplevelSurfaceRoleAttributes,
 };
 
-impl<D> Dispatch<XdgToplevel, XdgShellSurfaceUserData, D> for XdgShellState
+impl<D> Dispatch2<XdgToplevel, D> for XdgShellSurfaceUserData
 where
-    D: Dispatch<XdgToplevel, XdgShellSurfaceUserData>,
     D: XdgShellHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &wayland_server::Client,
         toplevel: &XdgToplevel,
         request: xdg_toplevel::Request,
-        data: &XdgShellSurfaceUserData,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
         match request {
             xdg_toplevel::Request::Destroy => {
-                if let Some(surface_data) = data.xdg_surface.data::<XdgSurfaceUserData>() {
+                if let Some(surface_data) = self.xdg_surface.data::<XdgSurfaceUserData>() {
                     surface_data.has_active_role.store(false, Ordering::Release);
+                }
+
+                if let Some(decoration) = self.decoration.lock().unwrap().clone() {
+                    decoration.post_error(
+                        zxdg_toplevel_decoration_v1::Error::Orphaned,
+                        "The xdg_toplevel_decoration object must be destroyed before its xdg_toplevel.",
+                    );
                 }
             }
             xdg_toplevel::Request::SetParent { parent } => {
@@ -118,12 +128,26 @@ where
                 }
             }
             xdg_toplevel::Request::SetMaxSize { width, height } => {
-                with_toplevel_pending_state(data, |toplevel_data| {
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        "The max size cannot be negative",
+                    );
+                    return;
+                }
+                with_toplevel_pending_state(self, |toplevel_data| {
                     toplevel_data.max_size = (width, height).into();
                 });
             }
             xdg_toplevel::Request::SetMinSize { width, height } => {
-                with_toplevel_pending_state(data, |toplevel_data| {
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        "The min size cannot be negative",
+                    );
+                    return;
+                }
+                with_toplevel_pending_state(self, |toplevel_data| {
                     toplevel_data.min_size = (width, height).into();
                 });
             }
@@ -153,14 +177,9 @@ where
         }
     }
 
-    fn destroyed(
-        state: &mut D,
-        _client_id: ClientId,
-        xdg_toplevel: &XdgToplevel,
-        data: &XdgShellSurfaceUserData,
-    ) {
-        data.alive_tracker.destroy_notify();
-        data.decoration.lock().unwrap().take();
+    fn destroyed(&self, state: &mut D, _client_id: ClientId, xdg_toplevel: &XdgToplevel) {
+        self.alive_tracker.destroy_notify();
+        self.decoration.lock().unwrap().take();
 
         if let Some(index) = state
             .xdg_shell_state()
@@ -180,6 +199,10 @@ where
                     .unwrap() = Default::default();
 
                 let mut guard = states.cached_state.get::<SurfaceCachedState>();
+                *guard.pending() = Default::default();
+                *guard.current() = Default::default();
+
+                let mut guard = states.cached_state.get::<ToplevelCachedState>();
                 *guard.pending() = Default::default();
                 *guard.current() = Default::default();
             })

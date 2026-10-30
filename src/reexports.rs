@@ -13,7 +13,10 @@ pub use glow;
 pub use input;
 #[cfg(feature = "renderer_pixman")]
 pub use pixman;
+pub use reis;
 pub use rustix;
+#[cfg(feature = "tracy_gpu_profiling")]
+pub use tracy_client;
 #[cfg(feature = "backend_udev")]
 pub use udev;
 #[cfg(feature = "wayland_frontend")]

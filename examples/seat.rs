@@ -1,13 +1,19 @@
+#![allow(
+    clippy::disallowed_macros,
+    reason = "stripped-down demo, terminal prints are its user-visible feedback"
+)]
+
 use std::sync::Arc;
 
-use smithay::input::{keyboard::FilterResult, Seat, SeatHandler, SeatState};
+use smithay::backend::input::InputTime;
+use smithay::input::{Seat, SeatHandler, SeatState, keyboard::FilterResult};
 use smithay::reexports::wayland_server::{
+    Display, ListeningSocket,
     backend::{ClientData, ClientId, DisconnectReason},
     protocol::wl_surface::WlSurface,
-    Display, ListeningSocket,
 };
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
-use smithay::{delegate_compositor, delegate_seat};
+use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
 
 struct App {
     compositor_state: CompositorState,
@@ -27,6 +33,8 @@ impl SeatHandler for App {
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
 }
+
+impl PointerConstraintsHandler for App {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<App> = Display::new()?;
@@ -64,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             smithay::backend::input::Keycode::from(9u32),
             smithay::backend::input::KeyState::Pressed,
             0.into(),
-            0,
+            InputTime::now(),
             |_, _, _| {
                 if false {
                     FilterResult::Intercept(0)
@@ -104,5 +112,4 @@ impl CompositorHandler for App {
     fn commit(&mut self, _surface: &WlSurface) {}
 }
 
-delegate_compositor!(App);
-delegate_seat!(App);
+smithay::delegate_dispatch2!(App);

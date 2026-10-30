@@ -11,7 +11,6 @@
 //! ```no_run
 //! # extern crate wayland_server;
 //! #
-//! use smithay::delegate_layer_shell;
 //! use smithay::wayland::shell::wlr_layer::{WlrLayerShellState, WlrLayerShellHandler, LayerSurface, Layer};
 //! use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 //!
@@ -39,28 +38,28 @@
 //!         // your implementation
 //!     }
 //! }
-//! // let smithay implement wayland_server::DelegateDispatch
-//! delegate_layer_shell!(State);
+//!
+//! smithay::delegate_dispatch2!(State);
 //!
 //! // You're now ready to go!
 //! ```
 
 use std::sync::{Arc, Mutex};
 
+use tracing::{trace, trace_span};
 use wayland_protocols_wlr::layer_shell::v1::server::{
-    zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
-    zwlr_layer_surface_v1,
+    zwlr_layer_shell_v1::ZwlrLayerShellV1, zwlr_layer_surface_v1,
 };
 use wayland_server::{
+    Client, DisplayHandle, GlobalDispatch, Resource as _,
     backend::GlobalId,
     protocol::{wl_output::WlOutput, wl_surface},
-    Client, DisplayHandle, GlobalDispatch, Resource,
 };
 
 use crate::{
-    utils::{alive_tracker::IsAlive, Logical, Serial, Size, SERIAL_COUNTER},
+    utils::{Logical, SERIAL_COUNTER, Serial, Size, alive_tracker::IsAlive},
     wayland::{
-        compositor::{self, Cacheable},
+        compositor::{self, BufferAssignment, Cacheable, SurfaceAttributes},
         shell::xdg,
     },
 };
@@ -74,7 +73,7 @@ pub use types::{Anchor, ExclusiveZone, KeyboardInteractivity, Layer, Margins};
 /// The role of a wlr_layer_shell_surface
 pub const LAYER_SURFACE_ROLE: &str = "zwlr_layer_surface_v1";
 
-/// Data associated with XDG popup surface  
+/// Data associated with layer surface
 ///
 /// ```no_run
 /// use smithay::wayland::compositor;
@@ -91,11 +90,6 @@ pub type LayerSurfaceData = Mutex<LayerSurfaceAttributes>;
 #[derive(Debug)]
 pub struct LayerSurfaceAttributes {
     surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-    /// Defines if the surface has received at least one
-    /// layer_surface.ack_configure from the client
-    pub configured: bool,
-    /// The serial of the last acked configure
-    pub configure_serial: Option<Serial>,
     /// Holds the state if the surface has sent the initial
     /// configure event to the client. It is expected that
     /// during the first commit a initial
@@ -109,26 +103,20 @@ pub struct LayerSurfaceAttributes {
     pending_configures: Vec<LayerSurfaceConfigure>,
     /// Holds the pending state as set by the server.
     pub server_pending: Option<LayerSurfaceState>,
-    /// Holds the last server_pending state that has been acknowledged
-    /// by the client. This state should be cloned to the current
-    /// during a commit.
-    pub last_acked: Option<LayerSurfaceState>,
-    /// Holds the current state of the layer after a successful
-    /// commit.
-    pub current: LayerSurfaceState,
+    /// Holds the last configure that has been acknowledged by the client. This state should be
+    /// cloned to the current during a commit. Note that this state can be newer than the last
+    /// acked state at the time of the last commit.
+    pub last_acked: Option<LayerSurfaceConfigure>,
 }
 
 impl LayerSurfaceAttributes {
     fn new(surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1) -> Self {
         Self {
             surface,
-            configured: false,
-            configure_serial: None,
             initial_configure_sent: false,
             pending_configures: Vec::new(),
             server_pending: None,
             last_acked: None,
-            current: Default::default(),
         }
     }
 
@@ -139,62 +127,64 @@ impl LayerSurfaceAttributes {
             .find(|configure| configure.serial == serial)
             .cloned()?;
 
-        self.last_acked = Some(configure.state.clone());
+        self.last_acked = Some(configure);
 
-        self.configured = true;
-        self.configure_serial = Some(serial);
         self.pending_configures.retain(|c| c.serial > serial);
         Some(configure)
     }
 
     fn reset(&mut self) {
-        self.configured = false;
-        self.configure_serial = None;
         self.initial_configure_sent = false;
         self.pending_configures = Vec::new();
         self.server_pending = None;
         self.last_acked = None;
-        self.current = Default::default();
     }
 
-    fn current_server_state(&self) -> &LayerSurfaceState {
+    fn current_server_state(&self) -> LayerSurfaceState {
         self.pending_configures
             .last()
             .map(|c| &c.state)
-            .or(self.last_acked.as_ref())
-            .unwrap_or(&self.current)
+            .or(self.last_acked.as_ref().map(|c| &c.state))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn has_pending_changes(&self) -> bool {
         self.server_pending
             .as_ref()
-            .map(|s| s != self.current_server_state())
+            .map(|s| *s != self.current_server_state())
             .unwrap_or(false)
     }
 }
 
 /// State of a layer surface
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub struct LayerSurfaceState {
     /// The suggested size of the surface
     pub size: Option<Size<i32, Logical>>,
 }
 
 /// Represents the client pending state
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct LayerSurfaceCachedState {
     /// The size requested by the client
     pub size: Size<i32, Logical>,
     /// Anchor bitflags, describing how the layers surface should be positioned and sized
     pub anchor: Anchor,
-    /// Descripton of exclusive zone
+    /// Description of exclusive zone
     pub exclusive_zone: ExclusiveZone,
+    /// Edge for exclusive zone
+    pub exclusive_edge: Option<Anchor>,
     /// Describes distance from the anchor point of the output
     pub margin: Margins,
     /// Describes how keyboard events are delivered to this surface
     pub keyboard_interactivity: KeyboardInteractivity,
     /// The layer that the surface is rendered on
     pub layer: Layer,
+    /// Configure last acknowledged by the client at the time of the commit.
+    ///
+    /// Reset to `None` when the surface unmaps.
+    pub last_acked: Option<LayerSurfaceConfigure>,
 }
 
 impl Cacheable for LayerSurfaceCachedState {
@@ -240,7 +230,7 @@ impl WlrLayerShellState {
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
     {
         let shell_global = display.create_global::<D, ZwlrLayerShellV1, WlrLayerShellGlobalData>(
-            4,
+            5,
             WlrLayerShellGlobalData {
                 filter: Box::new(filter),
             },
@@ -258,7 +248,7 @@ impl WlrLayerShellState {
     }
 
     /// Access all the shell surfaces known by this handler
-    pub fn layer_surfaces(&self) -> impl DoubleEndedIterator<Item = LayerSurface> {
+    pub fn layer_surfaces(&self) -> impl DoubleEndedIterator<Item = LayerSurface> + use<> {
         self.known_layers.lock().unwrap().clone().into_iter()
     }
 }
@@ -288,6 +278,10 @@ pub trait WlrLayerShellHandler {
     fn ack_configure(&mut self, surface: wl_surface::WlSurface, configure: LayerSurfaceConfigure) {}
 
     /// A layer surface was destroyed.
+    ///
+    /// Note: Destruction might happen explicitly by the client, or implicitly
+    /// when the client quits. In case of implicit destruction the order the
+    /// callbacks are called in is undefined.
     fn layer_destroyed(&mut self, surface: LayerSurface) {}
 }
 
@@ -327,7 +321,7 @@ impl LayerSurface {
                 attributes
                     .server_pending
                     .take()
-                    .unwrap_or_else(|| attributes.current_server_state().clone()),
+                    .unwrap_or_else(|| attributes.current_server_state()),
             );
         }
 
@@ -377,14 +371,14 @@ impl LayerSurface {
 
             let state = self
                 .get_pending_state(&mut attributes)
-                .unwrap_or_else(|| attributes.current_server_state().clone());
+                .unwrap_or_else(|| attributes.current_server_state());
 
             let configure = LayerSurfaceConfigure {
                 serial: SERIAL_COUNTER.next_serial(),
                 state,
             };
 
-            attributes.pending_configures.push(configure.clone());
+            attributes.pending_configures.push(configure);
             attributes.initial_configure_sent = true;
 
             configure
@@ -396,30 +390,6 @@ impl LayerSurface {
         self.shell_surface
             .configure(serial.into(), width as u32, height as u32);
         serial
-    }
-
-    /// Make sure this surface was configured
-    ///
-    /// Returns `true` if it was, if not, returns `false` and raise
-    /// a protocol error to the associated layer surface. Also returns `false`
-    /// if the surface is already destroyed.
-    pub fn ensure_configured(&self) -> bool {
-        let configured = compositor::with_states(&self.wl_surface, |states| {
-            states
-                .data_map
-                .get::<Mutex<LayerSurfaceAttributes>>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .configured
-        });
-        if !configured {
-            self.shell_surface.post_error(
-                zwlr_layer_shell_v1::Error::AlreadyConstructed,
-                "layer_surface has never been configured",
-            );
-        }
-        configured
     }
 
     /// Send a "close" event to the client
@@ -454,7 +424,7 @@ impl LayerSurface {
                 .lock()
                 .unwrap();
             if attributes.server_pending.is_none() {
-                attributes.server_pending = Some(attributes.current_server_state().clone());
+                attributes.server_pending = Some(attributes.current_server_state());
             }
 
             let server_pending = attributes.server_pending.as_mut().unwrap();
@@ -479,21 +449,125 @@ impl LayerSurface {
         })
     }
 
-    /// Gets a copy of the current state of this layer
-    ///
-    /// Returns `None` if the underlying surface has been
-    /// destroyed
-    pub fn current_state(&self) -> LayerSurfaceState {
+    /// Provides access to the current committed cached state.
+    pub fn with_cached_state<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&LayerSurfaceCachedState) -> T,
+    {
         compositor::with_states(&self.wl_surface, |states| {
-            let attributes = states
-                .data_map
-                .get::<Mutex<LayerSurfaceAttributes>>()
-                .unwrap()
-                .lock()
-                .unwrap();
-
-            attributes.current.clone()
+            let mut guard = states.cached_state.get::<LayerSurfaceCachedState>();
+            f(guard.current())
         })
+    }
+
+    /// Provides access to the current committed state.
+    ///
+    /// This is the state that the client last acked before making the current commit.
+    pub fn with_committed_state<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(Option<&LayerSurfaceState>) -> T,
+    {
+        self.with_cached_state(move |state| f(state.last_acked.as_ref().map(|c| &c.state)))
+    }
+
+    /// Handles the role specific commit error checking
+    ///
+    /// This should be called when the underlying WlSurface
+    /// handles a wl_surface.commit request.
+    pub(crate) fn pre_commit_hook<D: 'static>(
+        _state: &mut D,
+        _dh: &DisplayHandle,
+        surface: &wl_surface::WlSurface,
+    ) {
+        let _span = trace_span!("layer-surface pre-commit", surface = %surface.id()).entered();
+
+        compositor::with_states(surface, |states| {
+            let mut role = states.data_map.get::<LayerSurfaceData>().unwrap().lock().unwrap();
+
+            if !role.surface.is_alive() {
+                return;
+            }
+
+            let mut guard_layer = states.cached_state.get::<LayerSurfaceCachedState>();
+            let pending = guard_layer.pending();
+
+            if pending.size.w == 0 && !pending.anchor.anchored_horizontally() {
+                role.surface.post_error(
+                    zwlr_layer_surface_v1::Error::InvalidSize,
+                    "width 0 requested without setting left and right anchors",
+                );
+                return;
+            }
+
+            if pending.size.h == 0 && !pending.anchor.anchored_vertically() {
+                role.surface.post_error(
+                    zwlr_layer_surface_v1::Error::InvalidSize,
+                    "height 0 requested without setting top and bottom anchors",
+                );
+                return;
+            }
+
+            if let Some(edge) = pending.exclusive_edge {
+                if !pending.anchor.contains(edge) {
+                    role.surface.post_error(
+                        zwlr_layer_surface_v1::Error::InvalidExclusiveEdge,
+                        "exclusive edge is not an anchor",
+                    );
+                    return;
+                }
+            }
+
+            // The presence of last_acked always follows the buffer assignment because the
+            // surface is not allowed to attach a buffer without acking the initial configure.
+            let had_buffer_before = pending.last_acked.is_some();
+
+            let mut guard_surface = states.cached_state.get::<SurfaceAttributes>();
+            let has_buffer = match &guard_surface.pending().buffer {
+                Some(BufferAssignment::NewBuffer(_)) => true,
+                Some(BufferAssignment::Removed) => false,
+                None => had_buffer_before,
+            };
+            // Need to check had_buffer_before in case the client attaches a null buffer for the
+            // initial commit---we don't want to consider that as "got unmapped" and reset role.
+            // Reproducer: waybar.
+            let got_unmapped = had_buffer_before && !has_buffer;
+
+            if has_buffer {
+                let Some(last_acked) = role.last_acked else {
+                    role.surface.post_error(
+                        zwlr_layer_surface_v1::Error::InvalidSurfaceState,
+                        "must ack the initial configure before attaching buffer",
+                    );
+                    return;
+                };
+
+                // The surface remains, or became mapped, track the last acked state.
+                pending.last_acked = Some(last_acked);
+            } else {
+                // The surface remains, or became, unmapped, meaning that it's in the initial
+                // configure stage.
+                pending.last_acked = None;
+            }
+
+            if got_unmapped {
+                trace!(
+                    "got unmapped; resetting role and cached state; have {} pending configures",
+                    role.pending_configures.len()
+                );
+
+                // All attributes are discarded when an xdg_surface is unmapped. Though, we keep
+                // the list of pending configures because there's no way for a surface to tell
+                // an in-flight configure apart from our next initial configure after unmapping.
+                let pending_configures = std::mem::take(&mut role.pending_configures);
+                role.reset();
+                role.pending_configures = pending_configures;
+                let layer = pending.layer;
+                *guard_layer.pending() = LayerSurfaceCachedState {
+                    layer,
+                    ..Default::default()
+                };
+            }
+        });
     }
 
     /// Access the underlying `zwlr_layer_surface_v1` of this layer surface
@@ -504,7 +578,7 @@ impl LayerSurface {
 }
 
 /// A configure message for layer surfaces
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct LayerSurfaceConfigure {
     /// The state associated with this configure
     pub state: LayerSurfaceState,
@@ -515,28 +589,4 @@ pub struct LayerSurfaceConfigure {
     /// from a client for a serial will validate all pending lower
     /// serials.
     pub serial: Serial,
-}
-
-/// Macro to delegate implementation of wlr layer shell to [`WlrLayerShellState`].
-///
-/// You must also implement [`WlrLayerShellHandler`] to use this.
-#[macro_export]
-macro_rules! delegate_layer_shell {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        type __ZwlrLayerShellV1 =
-            $crate::reexports::wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
-        type __ZwlrLayerShellSurfaceV1 =
-            $crate::reexports::wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __ZwlrLayerShellV1: ()
-        ] => $crate::wayland::shell::wlr_layer::WlrLayerShellState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __ZwlrLayerShellSurfaceV1: $crate::wayland::shell::wlr_layer::WlrLayerSurfaceUserData
-        ] => $crate::wayland::shell::wlr_layer::WlrLayerShellState);
-
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __ZwlrLayerShellV1: $crate::wayland::shell::wlr_layer::WlrLayerShellGlobalData
-        ] => $crate::wayland::shell::wlr_layer::WlrLayerShellState);
-    };
 }

@@ -8,7 +8,6 @@
 //! extern crate wayland_server;
 //! extern crate smithay;
 //!
-//! use smithay::delegate_kde_decoration;
 //! use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 //! use wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode;
 //!
@@ -28,7 +27,7 @@
 //!     }
 //! }
 //!
-//! delegate_kde_decoration!(State);
+//! smithay::delegate_dispatch2!(State);
 //! ```
 
 use wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
@@ -40,6 +39,8 @@ use wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decor
 use wayland_server::backend::GlobalId;
 use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::{Client, Dispatch, DisplayHandle, GlobalDispatch, WEnum};
+
+use crate::wayland::GlobalData;
 
 /// KDE server decoration handler.
 pub trait KdeDecorationHandler {
@@ -89,13 +90,17 @@ pub struct KdeDecorationManagerGlobalData {
     pub(crate) filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
 }
 
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct KwinServerDecorationData(pub(crate) WlSurface);
+
 impl KdeDecorationState {
     /// Create a new KDE server decoration global.
     pub fn new<D>(display: &DisplayHandle, default_mode: DefaultMode) -> Self
     where
         D: GlobalDispatch<OrgKdeKwinServerDecorationManager, KdeDecorationManagerGlobalData>
-            + Dispatch<OrgKdeKwinServerDecorationManager, ()>
-            + Dispatch<OrgKdeKwinServerDecoration, WlSurface>
+            + Dispatch<OrgKdeKwinServerDecorationManager, GlobalData>
+            + Dispatch<OrgKdeKwinServerDecoration, KwinServerDecorationData>
             + KdeDecorationHandler
             + 'static,
     {
@@ -108,8 +113,8 @@ impl KdeDecorationState {
     pub fn new_with_filter<D, F>(display: &DisplayHandle, default_mode: DefaultMode, filter: F) -> Self
     where
         D: GlobalDispatch<OrgKdeKwinServerDecorationManager, KdeDecorationManagerGlobalData>
-            + Dispatch<OrgKdeKwinServerDecorationManager, ()>
-            + Dispatch<OrgKdeKwinServerDecoration, WlSurface>
+            + Dispatch<OrgKdeKwinServerDecorationManager, GlobalData>
+            + Dispatch<OrgKdeKwinServerDecoration, KwinServerDecorationData>
             + KdeDecorationHandler
             + 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
@@ -130,22 +135,12 @@ impl KdeDecorationState {
     pub fn global(&self) -> GlobalId {
         self.kde_decoration_manager.clone()
     }
-}
 
-#[allow(missing_docs)] // TODO
-#[macro_export]
-macro_rules! delegate_kde_decoration {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::OrgKdeKwinServerDecorationManager: $crate::wayland::shell::kde::decoration::KdeDecorationManagerGlobalData
-        ] => $crate::wayland::shell::kde::decoration::KdeDecorationState);
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::OrgKdeKwinServerDecorationManager: ()
-        ] => $crate::wayland::shell::kde::decoration::KdeDecorationState);
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::OrgKdeKwinServerDecoration: $crate::reexports::wayland_server::protocol::wl_surface::WlSurface
-        ] => $crate::wayland::shell::kde::decoration::KdeDecorationState);
-    };
+    /// Updates the default decoration mode.
+    ///
+    /// The new default mode will only be sent to new binds to the manager object; it is up to you
+    /// to update any existing decoration instances with the new mode, if desired.
+    pub fn set_default_mode(&mut self, default_mode: DefaultMode) {
+        self.default_mode = default_mode;
+    }
 }

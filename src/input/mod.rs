@@ -17,14 +17,14 @@
 //!
 //! ```
 //! use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus};
-//! # use smithay::backend::input::KeyState;
+//! # use smithay::backend::input::{InputTime, KeyState};
 //! # use smithay::input::{
 //! #   pointer::{PointerTarget, AxisFrame, MotionEvent, ButtonEvent, RelativeMotionEvent,
 //! #             GestureSwipeBeginEvent, GestureSwipeUpdateEvent, GestureSwipeEndEvent,
 //! #             GesturePinchBeginEvent, GesturePinchUpdateEvent, GesturePinchEndEvent,
 //! #             GestureHoldBeginEvent, GestureHoldEndEvent},
 //! #   keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
-//! #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget},
+//! #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget, FrameMarker},
 //! # };
 //! # use smithay::utils::{IsAlive, Serial};
 //!
@@ -52,7 +52,7 @@
 //! #   fn button(&self, seat: &Seat<State>, data: &mut State, event: &ButtonEvent) {}
 //! #   fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {}
 //! #   fn frame(&self, seat: &Seat<State>, data: &mut State) {}
-//! #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {}
+//! #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: InputTime) {}
 //! #   fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {}
 //! #   fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {}
 //! #   fn gesture_swipe_end(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeEndEvent) {}
@@ -72,18 +72,19 @@
 //! #       key: KeysymHandle<'_>,
 //! #       state: KeyState,
 //! #       serial: Serial,
-//! #       time: u32,
+//! #       time: InputTime,
 //! #   ) {}
 //! #   fn modifiers(&self, seat: &Seat<State>, data: &mut State, modifiers: ModifiersState, serial: Serial) {}
 //! # }
 //! # impl TouchTarget<State> for Target {
-//! #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent, seq: Serial) {}
-//! #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent, seq: Serial) {}
-//! #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent, seq: Serial) {}
-//! #   fn frame(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-//! #   fn cancel(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-//! #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent, seq: Serial) {}
-//! #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent, seq: Serial) {}
+//! #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent) {}
+//! #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent) {}
+//! #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent) {}
+//! #   fn frame(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+//! #   fn cancel(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+//! #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent) {}
+//! #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent) {}
+//! #   fn last_frame(&self, seat: &Seat<State>, data: &mut State) -> Option<FrameMarker> { unimplemented!() }
 //! # }
 //!
 //! // implement the required traits
@@ -110,7 +111,7 @@
 //! Once the seat is initialized, you can add capabilities to it.
 //!
 //! Currently, pointer, touch and keyboard capabilities are supported by this module.
-//! [`tablet_manager`](crate::wayland::tablet_manager) also provides client interaction for drawing tablets.
+//! [`tablet`] provides similar abstractions for drawing tablets.
 //!
 //! You can add these capabilities via methods of the [`Seat`] struct:
 //! [`Seat::add_keyboard`], [`Seat::add_pointer`] and [`Seat::add_touch`].
@@ -125,6 +126,7 @@ use std::{
 };
 
 use tracing::{info_span, instrument};
+use xkbcommon::xkb::ContextFlags;
 
 use self::touch::TouchTarget;
 use self::{
@@ -135,20 +137,28 @@ use self::{
     pointer::{CursorImageStatus, PointerHandle, PointerTarget},
     touch::TouchGrab,
 };
-use crate::utils::{user_data::UserDataMap, Serial};
+use crate::{
+    input::{
+        pointer::{ClickGrab, GrabStartData as PointerGrabStartData, PointerGrab},
+        touch::{GrabStartData as TouchGrabStartData, TouchDownGrab},
+    },
+    utils::{Serial, user_data::UserDataMap},
+};
 
+pub mod dnd;
 pub mod keyboard;
 pub mod pointer;
+pub mod tablet;
 pub mod touch;
 
 /// Handler trait for Seats
-pub trait SeatHandler: Sized {
+pub trait SeatHandler: Sized + 'static {
     /// Type used to represent the target currently holding the keyboard focus
-    type KeyboardFocus: KeyboardTarget<Self> + 'static;
+    type KeyboardFocus: KeyboardTarget<Self> + PartialEq + Clone + 'static;
     /// Type used to represent the target currently holding the pointer focus
-    type PointerFocus: PointerTarget<Self> + 'static;
+    type PointerFocus: PointerTarget<Self> + PartialEq + Clone + 'static;
     /// Type used to represent the target currently holding the touch focus
-    type TouchFocus: TouchTarget<Self> + 'static;
+    type TouchFocus: TouchTarget<Self> + PartialEq + Clone + 'static;
 
     /// [SeatState] getter
     fn seat_state(&mut self) -> &mut SeatState<Self>;
@@ -161,6 +171,24 @@ pub trait SeatHandler: Sized {
 
     /// Callback that will be notified whenever the keyboard led state changes.
     fn led_state_changed(&mut self, _seat: &Seat<Self>, _led_state: LedState) {}
+
+    /// Provides the implicit pointer grab for clicks
+    ///
+    /// When the user presses a pointer button, an implicit pointer grab is installed. If your
+    /// compositor needs custom behavior for this grab, you can implement this trait item and
+    /// return your own [`PointerGrab`] implementation.
+    fn click_grab(&mut self, start_data: PointerGrabStartData<Self>) -> impl PointerGrab<Self> {
+        ClickGrab::new(start_data)
+    }
+
+    /// Provides the implicit touch grab for down events
+    ///
+    /// When the user presses down on the touchscreen, an implicit grab is installed. If your
+    /// compositor needs custom behavior for this grab, you can implement this trait item and
+    /// return your own [`TouchGrab`] implementation.
+    fn touch_down_grab(&mut self, start_data: TouchGrabStartData<Self>) -> impl TouchGrab<Self> {
+        TouchDownGrab::new(start_data)
+    }
 }
 /// Delegate type for all [Seat] globals.
 ///
@@ -362,14 +390,14 @@ impl<D: SeatHandler + 'static> Seat<D> {
     ///
     /// ```no_run
     /// # use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus};
-    /// # use smithay::backend::input::KeyState;
+    /// # use smithay::backend::input::{InputTime, KeyState};
     /// # use smithay::input::{
     /// #   pointer::{PointerTarget, AxisFrame, MotionEvent, ButtonEvent, RelativeMotionEvent,
     /// #             GestureSwipeBeginEvent, GestureSwipeUpdateEvent, GestureSwipeEndEvent,
     /// #             GesturePinchBeginEvent, GesturePinchUpdateEvent, GesturePinchEndEvent,
     /// #             GestureHoldBeginEvent, GestureHoldEndEvent},
     /// #   keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
-    /// #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget},
+    /// #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget, FrameMarker},
     /// # };
     /// # use smithay::utils::{IsAlive, Serial};
     /// #
@@ -385,7 +413,7 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// #   fn button(&self, seat: &Seat<State>, data: &mut State, event: &ButtonEvent) {}
     /// #   fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {}
     /// #   fn frame(&self, seat: &Seat<State>, data: &mut State) {}
-    /// #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {}
+    /// #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: InputTime) {}
     /// #   fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {}
     /// #   fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {}
     /// #   fn gesture_swipe_end(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeEndEvent) {}
@@ -405,18 +433,19 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// #       key: KeysymHandle<'_>,
     /// #       state: KeyState,
     /// #       serial: Serial,
-    /// #       time: u32,
+    /// #       time: InputTime,
     /// #   ) {}
     /// #   fn modifiers(&self, seat: &Seat<State>, data: &mut State, modifiers: ModifiersState, serial: Serial) {}
     /// # }
     /// # impl TouchTarget<State> for Target {
-    /// #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent, seq: Serial) {}
-    /// #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent, seq: Serial) {}
-    /// #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent, seq: Serial) {}
-    /// #   fn frame(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-    /// #   fn cancel(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-    /// #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent, seq: Serial) {}
-    /// #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent, seq: Serial) {}
+    /// #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent) {}
+    /// #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent) {}
+    /// #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent) {}
+    /// #   fn frame(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+    /// #   fn cancel(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+    /// #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent) {}
+    /// #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent) {}
+    /// #   fn last_frame(&self, seat: &Seat<State>, data: &mut State) -> Option<FrameMarker> { unimplemented!() }
     /// # }
     /// # struct State;
     /// # impl SeatHandler for State {
@@ -483,14 +512,14 @@ impl<D: SeatHandler + 'static> Seat<D> {
     ///
     /// ```no_run
     /// # use smithay::input::{Seat, SeatState, SeatHandler, keyboard::XkbConfig, pointer::CursorImageStatus};
-    /// # use smithay::backend::input::KeyState;
+    /// # use smithay::backend::input::{InputTime, KeyState};
     /// # use smithay::input::{
     /// #   pointer::{PointerTarget, AxisFrame, MotionEvent, ButtonEvent, RelativeMotionEvent,
     /// #             GestureSwipeBeginEvent, GestureSwipeUpdateEvent, GestureSwipeEndEvent,
     /// #             GesturePinchBeginEvent, GesturePinchUpdateEvent, GesturePinchEndEvent,
     /// #             GestureHoldBeginEvent, GestureHoldEndEvent},
     /// #   keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
-    /// #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget},
+    /// #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget, FrameMarker},
     /// # };
     /// # use smithay::utils::{IsAlive, Serial};
     /// #
@@ -506,7 +535,7 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// #   fn button(&self, seat: &Seat<State>, data: &mut State, event: &ButtonEvent) {}
     /// #   fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {}
     /// #   fn frame(&self, seat: &Seat<State>, data: &mut State) {}
-    /// #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {}
+    /// #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: InputTime) {}
     /// #   fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {}
     /// #   fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {}
     /// #   fn gesture_swipe_end(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeEndEvent) {}
@@ -526,18 +555,19 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// #       key: KeysymHandle<'_>,
     /// #       state: KeyState,
     /// #       serial: Serial,
-    /// #       time: u32,
+    /// #       time: InputTime,
     /// #   ) {}
     /// #   fn modifiers(&self, seat: &Seat<State>, data: &mut State, modifiers: ModifiersState, serial: Serial) {}
     /// # }
     /// # impl TouchTarget<State> for Target {
-    /// #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent, seq: Serial) {}
-    /// #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent, seq: Serial) {}
-    /// #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent, seq: Serial) {}
-    /// #   fn frame(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-    /// #   fn cancel(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-    /// #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent, seq: Serial) {}
-    /// #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent, seq: Serial) {}
+    /// #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent) {}
+    /// #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent) {}
+    /// #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent) {}
+    /// #   fn frame(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+    /// #   fn cancel(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+    /// #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent) {}
+    /// #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent) {}
+    /// #   fn last_frame(&self, seat: &Seat<State>, data: &mut State) -> Option<FrameMarker> { unimplemented!() }
     /// # }
     /// #
     /// # struct State;
@@ -570,8 +600,29 @@ impl<D: SeatHandler + 'static> Seat<D> {
         repeat_delay: i32,
         repeat_rate: i32,
     ) -> Result<KeyboardHandle<D>, KeyboardError> {
+        Self::add_keyboard_with_context_flags(
+            self,
+            xkb_config,
+            repeat_delay,
+            repeat_rate,
+            xkbcommon::xkb::CONTEXT_NO_FLAGS,
+        )
+    }
+
+    /// [`Self::add_keyboard`] equivalent, that allows for overwriting default xkb::Context flags.
+    ///
+    /// For more info read [`Self::add_keyboard`] docs.
+    #[instrument(parent = &self.arc.span, skip(self))]
+    pub fn add_keyboard_with_context_flags(
+        &mut self,
+        xkb_config: keyboard::XkbConfig<'_>,
+        repeat_delay: i32,
+        repeat_rate: i32,
+        context_flags: ContextFlags,
+    ) -> Result<KeyboardHandle<D>, KeyboardError> {
         let mut inner = self.arc.inner.lock().unwrap();
-        let keyboard = self::keyboard::KeyboardHandle::new(xkb_config, repeat_delay, repeat_rate)?;
+        let keyboard =
+            self::keyboard::KeyboardHandle::new(xkb_config, repeat_delay, repeat_rate, context_flags)?;
         if inner.keyboard.is_some() {
             // there is already a keyboard, remove it and notify the clients
             // of the change
@@ -615,10 +666,17 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// # Examples
     ///
     /// ```no_run
+    /// # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
+    /// # use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
     /// # use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus};
     /// # use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
     /// #
     /// # struct State;
+    /// # impl CompositorHandler for State {
+    /// #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+    /// #     fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState { unimplemented!() }
+    /// #     fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+    /// # }
     /// # impl SeatHandler for State {
     /// #     type KeyboardFocus = WlSurface;
     /// #     type PointerFocus = WlSurface;
@@ -627,6 +685,7 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// #     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) { unimplemented!() }
     /// #     fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) { unimplemented!() }
     /// # }
+    /// # impl PointerConstraintsHandler for State {}
     /// # let mut seat: Seat<State> = unimplemented!();
     /// let touch_handle = seat.add_touch();
     /// ```
@@ -642,12 +701,12 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// points are released again.
     ///
     /// See [`Seat::add_touch`] for more information
-    pub fn add_touch_with_default_grab<F>(&mut self, defaut_grab: F) -> TouchHandle<D>
+    pub fn add_touch_with_default_grab<F>(&mut self, default_grab: F) -> TouchHandle<D>
     where
         F: Fn() -> Box<dyn TouchGrab<D>> + Send + 'static,
     {
         let mut inner = self.arc.inner.lock().unwrap();
-        let touch = TouchHandle::new(defaut_grab);
+        let touch = TouchHandle::new(default_grab);
         if inner.touch.is_some() {
             // If there's already a tocuh device, remove it notify the clients about the change.
             inner.touch = None;

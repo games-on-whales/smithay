@@ -1,13 +1,17 @@
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use smithay::backend::{
     allocator::{
+        Allocator, Buffer,
         dmabuf::AsDmabuf,
         vulkan::{ImageUsageFlags, VulkanAllocator},
-        Allocator, Buffer,
     },
-    vulkan::{version::Version, Instance, PhysicalDevice},
+    vulkan::{Instance, PhysicalDevice, version::Version},
 };
 
+#[allow(
+    clippy::disallowed_macros,
+    reason = "the extension and device lists are this example's output"
+)]
 fn main() {
     if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();

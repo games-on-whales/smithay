@@ -3,11 +3,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use wayland_server::{protocol::wl_surface::WlSurface, Resource};
+use wayland_server::{Resource, protocol::wl_surface::WlSurface};
 
 use crate::{
-    backend::input::{ButtonState, KeyState, Keycode},
+    backend::input::{ButtonState, InputTime, KeyState, Keycode},
     input::{
+        SeatHandler,
         keyboard::{
             GrabStartData as KeyboardGrabStartData, KeyboardGrab, KeyboardHandle, KeyboardInnerHandle,
             ModifiersState,
@@ -18,9 +19,8 @@ use crate::{
             GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab,
             PointerInnerHandle, RelativeMotionEvent,
         },
-        SeatHandler,
     },
-    utils::{DeadResource, IsAlive, Logical, Point, Serial, SERIAL_COUNTER},
+    utils::{DeadResource, IsAlive, Logical, Point, SERIAL_COUNTER, Serial},
     wayland::seat::WaylandFocus,
 };
 
@@ -64,8 +64,12 @@ struct PopupGrabInternal {
 }
 
 impl PopupGrabInternal {
-    fn active(&self) -> bool {
+    fn has_any_grabs(&self) -> bool {
         !self.active_grabs.is_empty() || !self.dismissed_grabs.is_empty()
+    }
+
+    fn has_active_grabs(&self) -> bool {
+        !self.active_grabs.is_empty()
     }
 
     fn current_grab(&self) -> Option<&WlSurface> {
@@ -105,9 +109,14 @@ pub(super) struct PopupGrabInner {
 }
 
 impl PopupGrabInner {
-    pub(super) fn active(&self) -> bool {
+    pub(super) fn has_any_grabs(&self) -> bool {
         let guard = self.internal.lock().unwrap();
-        guard.active()
+        guard.has_any_grabs()
+    }
+
+    pub(super) fn has_active_grabs(&self) -> bool {
+        let guard = self.internal.lock().unwrap();
+        guard.has_active_grabs()
     }
 
     fn current_grab(&self) -> Option<PopupKind> {
@@ -161,7 +170,7 @@ impl PopupGrabInner {
                 }
             }
             PopupUngrabStrategy::All => {
-                let grabs = guard.active_grabs.drain(..).collect::<Vec<_>>();
+                let grabs = std::mem::take(&mut guard.active_grabs);
 
                 if let Some(grab) = grabs.first() {
                     let dismissed = PopupManager::dismiss_popup(root, grab);
@@ -212,7 +221,7 @@ impl PopupGrabInner {
 /// One example would be to use a timer to automatically dismiss the popup after some
 /// timeout.
 ///
-/// The grab is obtained by calling [`PopupManager::grap_popup`](super::PopupManager::grab_popup).
+/// The grab is obtained by calling [`PopupManager::grab_popup`](super::PopupManager::grab_popup).
 pub struct PopupGrab<D>
 where
     D: SeatHandler + 'static,
@@ -322,7 +331,7 @@ where
     /// This will also return [`false`] if the root
     /// of the grab has been destroyed.
     pub fn has_ended(&self) -> bool {
-        !self.root.alive() || !self.toplevel_grab.active()
+        !self.root.alive() || !self.toplevel_grab.has_active_grabs()
     }
 
     /// Returns the current grabbed [`WlSurface`].
@@ -437,7 +446,7 @@ where
         state: KeyState,
         modifiers: Option<ModifiersState>,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         // Check if the grab changed and update the focus
         // If the grab has ended this will return the root
@@ -589,7 +598,7 @@ where
             return;
         }
 
-        // Check if the the client of the focused surface is still equal to the grabbed surface client
+        // Check if the client of the focused surface is still equal to the grabbed surface client
         // if not the popup will be dismissed
         if state == ButtonState::Pressed
             && !handle

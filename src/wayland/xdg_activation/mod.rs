@@ -7,7 +7,6 @@
 //! #
 //! use wayland_server::{protocol::wl_surface::WlSurface, DisplayHandle};
 //! use smithay::{
-//!     delegate_xdg_activation,
 //!     wayland::xdg_activation::{XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData}
 //! };
 //!
@@ -33,7 +32,7 @@
 //! }
 //!
 //! // Delegate xdg activation handling for State to XdgActivationState.
-//! delegate_xdg_activation!(State);
+//! smithay::delegate_dispatch2!(State);
 //!
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
 //! # let display_handle = display.handle();
@@ -47,20 +46,21 @@
 use std::{
     collections::HashMap,
     ops,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::Instant,
 };
 
 use wayland_protocols::xdg::activation::v1::server::xdg_activation_v1;
 use wayland_server::{
+    Dispatch, DisplayHandle, GlobalDispatch,
     backend::{ClientId, GlobalId},
     protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
-    Dispatch, DisplayHandle, GlobalDispatch,
 };
 
 use rand::distr::{Alphanumeric, SampleString};
 
-use crate::utils::{user_data::UserDataMap, Serial};
+use crate::utils::{Serial, user_data::UserDataMap};
+use crate::wayland::GlobalData;
 
 mod dispatch;
 
@@ -179,12 +179,12 @@ impl XdgActivationState {
     /// In order to use this abstraction, your `D` type needs to implement [`XdgActivationHandler`].
     pub fn new<D>(display: &DisplayHandle) -> XdgActivationState
     where
-        D: GlobalDispatch<xdg_activation_v1::XdgActivationV1, ()>
-            + Dispatch<xdg_activation_v1::XdgActivationV1, ()>
+        D: GlobalDispatch<xdg_activation_v1::XdgActivationV1, GlobalData>
+            + Dispatch<xdg_activation_v1::XdgActivationV1, GlobalData>
             + XdgActivationHandler
             + 'static,
     {
-        let global = display.create_global::<D, xdg_activation_v1::XdgActivationV1, _>(1, ());
+        let global = display.create_global::<D, xdg_activation_v1::XdgActivationV1, _>(1, GlobalData);
 
         XdgActivationState {
             global,
@@ -271,38 +271,12 @@ pub trait XdgActivationHandler {
     );
 }
 
-/// Data assoicated with an activation token protocol object.
+/// Data associated with an activation token protocol object.
 #[derive(Debug)]
 pub struct ActivationTokenData {
     constructed: AtomicBool,
     build: Mutex<TokenBuilder>,
     token: Mutex<Option<XdgActivationToken>>,
-}
-
-/// Macro to delegate implementation of the xdg activation to [`XdgActivationState`].
-///
-/// You must also implement [`XdgActivationHandler`] to use this.
-#[macro_export]
-macro_rules! delegate_xdg_activation {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        type __XdgActivationV1 =
-            $crate::reexports::wayland_protocols::xdg::activation::v1::server::xdg_activation_v1::XdgActivationV1;
-        type __XdgActivationTokenV1 =
-            $crate::reexports::wayland_protocols::xdg::activation::v1::server::xdg_activation_token_v1::XdgActivationTokenV1;
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __XdgActivationV1: ()
-        ] => $crate::wayland::xdg_activation::XdgActivationState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __XdgActivationTokenV1: $crate::wayland::xdg_activation::ActivationTokenData
-        ] => $crate::wayland::xdg_activation::XdgActivationState);
-
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __XdgActivationV1: ()
-            ] => $crate::wayland::xdg_activation::XdgActivationState
-        );
-    };
 }
 
 #[derive(Debug)]

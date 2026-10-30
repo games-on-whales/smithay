@@ -84,7 +84,7 @@ impl Time<Monotonic> {
     /// This should match timestamps from libinput:
     /// <https://wayland.freedesktop.org/libinput/doc/latest/timestamps.html>
     pub fn as_micros(&self) -> u64 {
-        // Assume monotonic clock (but not realitime) fits as microseconds in 64-bit
+        // Assume monotonic clock (but not realtime) fits as microseconds in 64-bit
         debug_assert!(self.tp.tv_sec >= 0);
         debug_assert!(self.tp.tv_nsec >= 0);
         self.tp.tv_sec as u64 * 1000000 + self.tp.tv_nsec as u64 / 1000
@@ -195,11 +195,10 @@ fn saturating_sub_timespec(lhs: Timespec, rhs: Timespec) -> Option<Duration> {
     if let Some(mut secs) = lhs_tv_sec.checked_sub(rhs_tv_sec) {
         let nanos = if lhs_tv_nsec >= rhs_tv_nsec {
             lhs_tv_nsec - rhs_tv_nsec
-        } else if let Some(sub_secs) = secs.checked_sub(1) {
+        } else {
+            let sub_secs = secs.checked_sub(1)?;
             secs = sub_secs;
             lhs_tv_nsec + (NANOS_PER_SEC as u64) - rhs_tv_nsec
-        } else {
-            return None;
         };
         debug_assert!(nanos < (NANOS_PER_SEC as u64));
         Some(Duration::new(secs, nanos as u32))
@@ -217,7 +216,9 @@ where
     fn add(self, rhs: T) -> Self::Output {
         let rhs = rhs.into();
         let tv_nsec = (self.tp.tv_nsec + rhs.tp.tv_nsec) % NANOS_PER_SEC;
-        let tv_sec = (self.tp.tv_sec + rhs.tp.tv_sec) + ((self.tp.tv_nsec + rhs.tp.tv_nsec) / NANOS_PER_SEC);
+        #[allow(clippy::useless_conversion)] // rust-clippy/issues/6466, PR 2103
+        let tv_sec =
+            (self.tp.tv_sec + rhs.tp.tv_sec) + i64::from((self.tp.tv_nsec + rhs.tp.tv_nsec) / NANOS_PER_SEC);
         Self::from(Timespec { tv_sec, tv_nsec })
     }
 }

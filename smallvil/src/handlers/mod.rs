@@ -7,15 +7,18 @@ use crate::Smallvil;
 // Wl Seat
 //
 
+use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
+use smithay::input::pointer::Focus;
 use smithay::input::{Seat, SeatHandler, SeatState};
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::Serial;
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::selection::data_device::{
-    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-};
+use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
 use smithay::wayland::selection::SelectionHandler;
-use smithay::{delegate_data_device, delegate_output, delegate_seat};
+use smithay::wayland::selection::data_device::{
+    DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
+};
 
 impl SeatHandler for Smallvil {
     type KeyboardFocus = WlSurface;
@@ -35,7 +38,7 @@ impl SeatHandler for Smallvil {
     }
 }
 
-delegate_seat!(Smallvil);
+impl PointerConstraintsHandler for Smallvil {}
 
 //
 // Wl Data Device
@@ -51,14 +54,37 @@ impl DataDeviceHandler for Smallvil {
     }
 }
 
-impl ClientDndGrabHandler for Smallvil {}
-impl ServerDndGrabHandler for Smallvil {}
+impl DndGrabHandler for Smallvil {}
+impl WaylandDndGrabHandler for Smallvil {
+    fn dnd_requested<S: Source>(
+        &mut self,
+        source: S,
+        _icon: Option<WlSurface>,
+        seat: Seat<Self>,
+        serial: Serial,
+        type_: GrabType,
+    ) {
+        match type_ {
+            GrabType::Pointer => {
+                let ptr = seat.get_pointer().unwrap();
+                let start_data = ptr.grab_start_data().unwrap();
 
-delegate_data_device!(Smallvil);
+                // create a dnd grab to start the operation
+                let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
+                ptr.set_grab(self, grab, serial, Focus::Keep);
+            }
+            GrabType::Touch => {
+                // smallvil lacks touch handling
+                source.cancel();
+            }
+        }
+    }
+}
 
 //
 // Wl Output & Xdg Output
 //
 
 impl OutputHandler for Smallvil {}
-delegate_output!(Smallvil);
+
+smithay::delegate_dispatch2!(Smallvil);

@@ -1,67 +1,64 @@
 use std::{convert::TryInto, process::Command, sync::atomic::Ordering};
 
-use crate::{focus::PointerFocusTarget, shell::FullscreenSurface, AnvilState};
+use crate::{AnvilState, focus::PointerFocusTarget, shell::FullscreenSurface};
 
 #[cfg(feature = "udev")]
 use crate::udev::UdevData;
 #[cfg(feature = "udev")]
-use smithay::backend::renderer::DebugFlags;
+use smithay::{backend::renderer::DebugFlags, input::tablet};
 
 use smithay::{
     backend::input::{
-        self, Axis, AxisSource, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
-        PointerAxisEvent, PointerButtonEvent,
+        self, Axis, AxisSource, Device, DeviceCapability, Event, GestureBeginEvent, GestureEndEvent,
+        GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _, InputBackend, InputEvent, InputTime,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, TouchEvent,
     },
-    desktop::{layer_map_for_output, WindowSurfaceType},
+    desktop::{WindowSurfaceType, layer_map_for_output},
     input::{
-        keyboard::{keysyms as xkb, FilterResult, Keysym, ModifiersState},
+        keyboard::{FilterResult, Keysym, ModifiersState, keysyms as xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{
+            GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
+            GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
+        },
+        tablet::{TabletDescriptor, TabletSeatTrait},
+        touch::{DownEvent, UpEvent},
     },
     output::Scale,
     reexports::{
         wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1,
         wayland_server::protocol::wl_pointer,
     },
-    utils::{Logical, Point, Serial, Transform, SERIAL_COUNTER as SCOUNTER},
+    utils::{Logical, Point, SERIAL_COUNTER as SCOUNTER, Serial, Transform},
     wayland::{
-        compositor::with_states,
         input_method::InputMethodSeat,
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
-        shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState},
+        shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer},
+        virtual_keyboard::{VirtualKeyboardBackend, VirtualKeyboardHandler, VirtualKeyboardSpecialEvent},
     },
 };
 
-#[cfg(any(feature = "winit", feature = "x11", feature = "udev"))]
 use smithay::backend::input::AbsolutePositionEvent;
 
 #[cfg(any(feature = "winit", feature = "x11"))]
 use smithay::output::Output;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::state::Backend;
 #[cfg(feature = "udev")]
 use smithay::{
     backend::{
         input::{
-            Device, DeviceCapability, GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _,
-            GestureSwipeUpdateEvent as _, PointerMotionEvent, ProximityState, TabletToolButtonEvent,
-            TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TouchEvent,
+            PointerMotionEvent, ProximityState, TabletToolButtonEvent, TabletToolEvent,
+            TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState,
         },
         session::Session,
     },
-    input::{
-        pointer::{
-            GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
-            GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
-            RelativeMotionEvent,
-        },
-        touch::{DownEvent, UpEvent},
-    },
+    input::pointer::RelativeMotionEvent,
     reexports::wayland_server::DisplayHandle,
     wayland::{
-        pointer_constraints::{with_pointer_constraint, PointerConstraint},
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
         seat::WaylandFocus,
-        tablet_manager::{TabletDescriptor, TabletSeatTrait},
     },
 };
 
@@ -141,21 +138,19 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let state = evt.state();
         debug!(?keycode, ?state, "key");
         let serial = SCOUNTER.next_serial();
-        let time = Event::time_msec(&evt);
+        let time = Event::time(&evt);
         let mut suppressed_keys = self.suppressed_keys.clone();
         let keyboard = self.seat.get_keyboard().unwrap();
 
         for layer in self.layer_shell_state.layer_surfaces().rev() {
-            let data = with_states(layer.wl_surface(), |states| {
-                *states.cached_state.get::<LayerSurfaceCachedState>().current()
+            let exclusive = layer.with_cached_state(|data| {
+                data.keyboard_interactivity == KeyboardInteractivity::Exclusive
+                    && (data.layer == WlrLayer::Top || data.layer == WlrLayer::Overlay)
             });
-            if data.keyboard_interactivity == KeyboardInteractivity::Exclusive
-                && (data.layer == WlrLayer::Top || data.layer == WlrLayer::Overlay)
-            {
+            if exclusive {
                 let surface = self.space.outputs().find_map(|o| {
                     let map = layer_map_for_output(o);
-                    let cloned = map.layers().find(|l| l.layer_surface() == &layer).cloned();
-                    cloned
+                    map.layers().find(|l| l.layer_surface() == &layer).cloned()
                 });
                 if let Some(surface) = surface {
                     keyboard.set_focus(self, Some(surface.into()), serial);
@@ -239,10 +234,112 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 button,
                 state: state.try_into().unwrap(),
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
         pointer.frame(self);
+    }
+
+    fn on_gesture_swipe_begin<B: InputBackend>(&mut self, evt: B::GestureSwipeBeginEvent) {
+        let serial = SCOUNTER.next_serial();
+        let pointer = self.pointer.clone();
+        pointer.gesture_swipe_begin(
+            self,
+            &GestureSwipeBeginEvent {
+                serial,
+                time: evt.time(),
+                fingers: evt.fingers(),
+            },
+        );
+    }
+
+    fn on_gesture_swipe_update<B: InputBackend>(&mut self, evt: B::GestureSwipeUpdateEvent) {
+        let pointer = self.pointer.clone();
+        pointer.gesture_swipe_update(
+            self,
+            &GestureSwipeUpdateEvent {
+                time: evt.time(),
+                delta: evt.delta(),
+            },
+        );
+    }
+
+    fn on_gesture_swipe_end<B: InputBackend>(&mut self, evt: B::GestureSwipeEndEvent) {
+        let serial = SCOUNTER.next_serial();
+        let pointer = self.pointer.clone();
+        pointer.gesture_swipe_end(
+            self,
+            &GestureSwipeEndEvent {
+                serial,
+                time: evt.time(),
+                cancelled: evt.cancelled(),
+            },
+        );
+    }
+
+    fn on_gesture_pinch_begin<B: InputBackend>(&mut self, evt: B::GesturePinchBeginEvent) {
+        let serial = SCOUNTER.next_serial();
+        let pointer = self.pointer.clone();
+        pointer.gesture_pinch_begin(
+            self,
+            &GesturePinchBeginEvent {
+                serial,
+                time: evt.time(),
+                fingers: evt.fingers(),
+            },
+        );
+    }
+
+    fn on_gesture_pinch_update<B: InputBackend>(&mut self, evt: B::GesturePinchUpdateEvent) {
+        let pointer = self.pointer.clone();
+        pointer.gesture_pinch_update(
+            self,
+            &GesturePinchUpdateEvent {
+                time: evt.time(),
+                delta: evt.delta(),
+                scale: evt.scale(),
+                rotation: evt.rotation(),
+            },
+        );
+    }
+
+    fn on_gesture_pinch_end<B: InputBackend>(&mut self, evt: B::GesturePinchEndEvent) {
+        let serial = SCOUNTER.next_serial();
+        let pointer = self.pointer.clone();
+        pointer.gesture_pinch_end(
+            self,
+            &GesturePinchEndEvent {
+                serial,
+                time: evt.time(),
+                cancelled: evt.cancelled(),
+            },
+        );
+    }
+
+    fn on_gesture_hold_begin<B: InputBackend>(&mut self, evt: B::GestureHoldBeginEvent) {
+        let serial = SCOUNTER.next_serial();
+        let pointer = self.pointer.clone();
+        pointer.gesture_hold_begin(
+            self,
+            &GestureHoldBeginEvent {
+                serial,
+                time: evt.time(),
+                fingers: evt.fingers(),
+            },
+        );
+    }
+
+    fn on_gesture_hold_end<B: InputBackend>(&mut self, evt: B::GestureHoldEndEvent) {
+        let serial = SCOUNTER.next_serial();
+        let pointer = self.pointer.clone();
+        pointer.gesture_hold_end(
+            self,
+            &GestureHoldEndEvent {
+                serial,
+                time: evt.time(),
+                cancelled: evt.cancelled(),
+            },
+        );
     }
 
     fn update_keyboard_focus(&mut self, location: Point<f64, Logical>, serial: Serial) {
@@ -411,7 +508,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let vertical_amount_discrete = evt.amount_v120(input::Axis::Vertical);
 
         {
-            let mut frame = AxisFrame::new(evt.time_msec()).source(evt.source());
+            let mut frame = AxisFrame::new(evt.time()).source(evt.source());
             if horizontal_amount != 0.0 {
                 frame = frame.relative_direction(Axis::Horizontal, evt.relative_direction(Axis::Horizontal));
                 frame = frame.value(Axis::Horizontal, horizontal_amount);
@@ -437,6 +534,126 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             let pointer = self.pointer.clone();
             pointer.axis(self, frame);
             pointer.frame(self);
+        }
+    }
+
+    fn touch_location_transformed<B: InputBackend, E: AbsolutePositionEvent<B>>(
+        &self,
+        evt: &E,
+    ) -> Option<Point<f64, Logical>> {
+        let output = self
+            .space
+            .outputs()
+            .find(|output| output.name().starts_with("eDP"))
+            .or_else(|| self.space.outputs().next());
+
+        let output = output?;
+        let output_geometry = self.space.output_geometry(output)?;
+
+        let transform = output.current_transform();
+        let size = transform.invert().transform_size(output_geometry.size);
+        Some(
+            transform.transform_point_in(evt.position_transformed(size), &size.to_f64())
+                + output_geometry.loc.to_f64(),
+        )
+    }
+
+    fn on_touch_down<B: InputBackend>(&mut self, evt: B::TouchDownEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+
+        let Some(touch_location) = self.touch_location_transformed(&evt) else {
+            return;
+        };
+
+        let serial = SCOUNTER.next_serial();
+        self.update_keyboard_focus(touch_location, serial);
+
+        let under = self.surface_under(touch_location);
+        handle.down(
+            self,
+            under,
+            &DownEvent {
+                slot: evt.slot(),
+                location: touch_location,
+                serial,
+                time: evt.time(),
+            },
+        );
+    }
+
+    fn on_touch_up<B: InputBackend>(&mut self, evt: B::TouchUpEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        let serial = SCOUNTER.next_serial();
+        handle.up(
+            self,
+            &UpEvent {
+                slot: evt.slot(),
+                serial,
+                time: evt.time(),
+            },
+        )
+    }
+
+    fn on_touch_motion<B: InputBackend>(&mut self, evt: B::TouchMotionEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        let Some(touch_location) = self.touch_location_transformed(&evt) else {
+            return;
+        };
+
+        let under = self.surface_under(touch_location);
+        handle.motion(
+            self,
+            under,
+            &smithay::input::touch::MotionEvent {
+                slot: evt.slot(),
+                location: touch_location,
+                time: evt.time(),
+            },
+        );
+    }
+
+    fn on_touch_frame<B: InputBackend>(&mut self, _evt: B::TouchFrameEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        handle.frame(self);
+    }
+
+    fn on_touch_cancel<B: InputBackend>(&mut self, _evt: B::TouchCancelEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        handle.cancel(self);
+    }
+
+    fn on_device_added<B: InputBackend>(&mut self, device: B::Device) {
+        let dh = &self.display_handle;
+        if device.has_capability(DeviceCapability::TabletTool) {
+            self.seat
+                .tablet_seat()
+                .add_wp_tablet(dh, &TabletDescriptor::from(&device));
+        }
+        if device.has_capability(DeviceCapability::Touch) && self.seat.get_touch().is_none() {
+            self.seat.add_touch();
+        }
+    }
+
+    fn on_device_removed<B: InputBackend>(&mut self, device: B::Device) {
+        if device.has_capability(DeviceCapability::TabletTool) {
+            let tablet_seat = self.seat.tablet_seat();
+
+            tablet_seat.remove_tablet(&TabletDescriptor::from(&device));
+
+            // If there are no tablets in seat we can remove all tools
+            if tablet_seat.count_tablets() == 0 {
+                tablet_seat.clear_tools();
+            }
         }
     }
 }
@@ -529,6 +746,23 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
             InputEvent::PointerButton { event } => self.on_pointer_button::<B>(event),
             InputEvent::PointerAxis { event } => self.on_pointer_axis::<B>(event),
+
+            InputEvent::GestureSwipeBegin { event, .. } => self.on_gesture_swipe_begin::<B>(event),
+            InputEvent::GestureSwipeUpdate { event, .. } => self.on_gesture_swipe_update::<B>(event),
+            InputEvent::GestureSwipeEnd { event, .. } => self.on_gesture_swipe_end::<B>(event),
+            InputEvent::GesturePinchBegin { event, .. } => self.on_gesture_pinch_begin::<B>(event),
+            InputEvent::GesturePinchUpdate { event, .. } => self.on_gesture_pinch_update::<B>(event),
+            InputEvent::GesturePinchEnd { event, .. } => self.on_gesture_pinch_end::<B>(event),
+            InputEvent::GestureHoldBegin { event, .. } => self.on_gesture_hold_begin::<B>(event),
+            InputEvent::GestureHoldEnd { event, .. } => self.on_gesture_hold_end::<B>(event),
+
+            InputEvent::TouchDown { event } => self.on_touch_down::<B>(event),
+            InputEvent::TouchUp { event } => self.on_touch_up::<B>(event),
+            InputEvent::TouchMotion { event } => self.on_touch_motion::<B>(event),
+            InputEvent::TouchFrame { event } => self.on_touch_frame::<B>(event),
+            InputEvent::TouchCancel { event } => self.on_touch_cancel::<B>(event),
+            InputEvent::DeviceAdded { device } => self.on_device_added::<B>(device),
+            InputEvent::DeviceRemoved { device } => self.on_device_removed::<B>(device),
             _ => (), // other events are not handled in anvil (yet)
         }
     }
@@ -551,7 +785,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             &MotionEvent {
                 location: pos,
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
         pointer.frame(self);
@@ -565,7 +799,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 keycode,
                 KeyState::Released,
                 SCOUNTER.next_serial(),
-                0,
+                InputTime::now(),
                 |_, _, _| FilterResult::Forward::<bool>,
             );
         }
@@ -603,7 +837,7 @@ impl AnvilState<UdevData> {
                             &MotionEvent {
                                 location,
                                 serial: SCOUNTER.next_serial(),
-                                time: self.clock.now().as_millis(),
+                                time: InputTime::now(),
                             },
                         );
                         pointer.frame(self);
@@ -641,7 +875,7 @@ impl AnvilState<UdevData> {
                             &MotionEvent {
                                 location: pointer_location,
                                 serial: SCOUNTER.next_serial(),
-                                time: self.clock.now().as_millis(),
+                                time: InputTime::now(),
                             },
                         );
                         pointer.frame(self);
@@ -680,7 +914,7 @@ impl AnvilState<UdevData> {
                             &MotionEvent {
                                 location: pointer_location,
                                 serial: SCOUNTER.next_serial(),
-                                time: self.clock.now().as_millis(),
+                                time: InputTime::now(),
                             },
                         );
                         pointer.frame(self);
@@ -751,28 +985,8 @@ impl AnvilState<UdevData> {
             InputEvent::TouchFrame { event } => self.on_touch_frame::<B>(event),
             InputEvent::TouchCancel { event } => self.on_touch_cancel::<B>(event),
 
-            InputEvent::DeviceAdded { device } => {
-                if device.has_capability(DeviceCapability::TabletTool) {
-                    self.seat
-                        .tablet_seat()
-                        .add_tablet::<Self>(dh, &TabletDescriptor::from(&device));
-                }
-                if device.has_capability(DeviceCapability::Touch) && self.seat.get_touch().is_none() {
-                    self.seat.add_touch();
-                }
-            }
-            InputEvent::DeviceRemoved { device } => {
-                if device.has_capability(DeviceCapability::TabletTool) {
-                    let tablet_seat = self.seat.tablet_seat();
-
-                    tablet_seat.remove_tablet(&TabletDescriptor::from(&device));
-
-                    // If there are no tablets in seat we can remove all tools
-                    if tablet_seat.count_tablets() == 0 {
-                        tablet_seat.clear_tools();
-                    }
-                }
-            }
+            InputEvent::DeviceAdded { device } => self.on_device_added::<B>(device),
+            InputEvent::DeviceRemoved { device } => self.on_device_removed::<B>(device),
             _ => {
                 // other events are not handled in anvil (yet)
             }
@@ -796,9 +1010,10 @@ impl AnvilState<UdevData> {
             with_pointer_constraint(&surface, &pointer, |constraint| match constraint {
                 Some(constraint) if constraint.is_active() => {
                     // Constraint does not apply if not within region
-                    if !constraint.region().map_or(true, |x| {
-                        x.contains((pointer_location - *surface_loc).to_i32_round())
-                    }) {
+                    if !constraint
+                        .region()
+                        .is_none_or(|x| x.contains((pointer_location - *surface_loc).to_i32_round()))
+                    {
                         return;
                     }
                     match &*constraint {
@@ -821,7 +1036,7 @@ impl AnvilState<UdevData> {
             &RelativeMotionEvent {
                 delta: evt.delta(),
                 delta_unaccel: evt.delta_unaccel(),
-                utime: evt.time(),
+                time: evt.time(),
             },
         );
 
@@ -831,26 +1046,40 @@ impl AnvilState<UdevData> {
             return;
         }
 
-        pointer_location += evt.delta();
+        // Clamp delta, such that the pointer never moves out of bounds
+        let mut delta = self.clamp_coords(pointer_location + evt.delta()) - pointer_location;
 
-        // clamp to screen limits
-        // this event is never generated by winit
-        pointer_location = self.clamp_coords(pointer_location);
+        // Clamp the individual x and y components of delta to respect confinement regions
+        if pointer_confined {
+            if let Some((_, surface_loc)) = &under {
+                if let Some(region) = &confine_region {
+                    // Clamp delta.x
+                    if !region.contains(
+                        (pointer_location + Point::new(delta.x, 0f64) - *surface_loc).to_i32_round(),
+                    ) {
+                        delta.x = 0f64;
+                    }
+
+                    // Clamp delta.y
+                    if !region.contains(
+                        (pointer_location + Point::new(0f64, delta.y) - *surface_loc).to_i32_round(),
+                    ) {
+                        delta.y = 0f64;
+                    }
+                }
+            }
+        }
+
+        pointer_location += delta;
 
         let new_under = self.surface_under(pointer_location);
 
-        // If confined, don't move pointer if it would go outside surface or region
+        // If confined, don't move pointer if it would go outside surface
         if pointer_confined {
-            if let Some((surface, surface_loc)) = &under {
+            if let Some((surface, _)) = &under {
                 if new_under.as_ref().and_then(|(under, _)| under.wl_surface()) != surface.wl_surface() {
                     pointer.frame(self);
                     return;
-                }
-                if let Some(region) = confine_region {
-                    if !region.contains((pointer_location - *surface_loc).to_i32_round()) {
-                        pointer.frame(self);
-                        return;
-                    }
                 }
             }
         }
@@ -861,7 +1090,7 @@ impl AnvilState<UdevData> {
             &MotionEvent {
                 location: pointer_location,
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
         pointer.frame(self);
@@ -874,7 +1103,7 @@ impl AnvilState<UdevData> {
             with_pointer_constraint(&under, &pointer, |constraint| match constraint {
                 Some(constraint) if !constraint.is_active() => {
                     let point = (pointer_location - surface_location).to_i32_round();
-                    if constraint.region().map_or(true, |region| region.contains(point)) {
+                    if constraint.region().is_none_or(|region| region.contains(point)) {
                         constraint.activate();
                     }
                 }
@@ -917,7 +1146,7 @@ impl AnvilState<UdevData> {
             &MotionEvent {
                 location: pointer_location,
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
         pointer.frame(self);
@@ -929,8 +1158,8 @@ impl AnvilState<UdevData> {
         if let Some(pointer_location) = self.touch_location_transformed(&evt) {
             let pointer = self.pointer.clone();
             let under = self.surface_under(pointer_location);
-            let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&evt.device()));
             let tool = tablet_seat.get_tool(&evt.tool());
+            let time = InputTime::now();
 
             pointer.motion(
                 self,
@@ -938,37 +1167,35 @@ impl AnvilState<UdevData> {
                 &MotionEvent {
                     location: pointer_location,
                     serial: SCOUNTER.next_serial(),
-                    time: self.clock.now().as_millis(),
+                    time,
                 },
             );
 
-            if let (Some(tablet), Some(tool)) = (tablet, tool) {
-                if evt.pressure_has_changed() {
-                    tool.pressure(evt.pressure());
-                }
-                if evt.distance_has_changed() {
-                    tool.distance(evt.distance());
-                }
-                if evt.tilt_has_changed() {
-                    tool.tilt(evt.tilt());
-                }
-                if evt.slider_has_changed() {
-                    tool.slider_position(evt.slider_position());
-                }
-                if evt.rotation_has_changed() {
-                    tool.rotation(evt.rotation());
-                }
-                if evt.wheel_has_changed() {
-                    tool.wheel(evt.wheel_delta(), evt.wheel_delta_discrete());
-                }
+            if let Some(tool) = tool {
+                let frame = tablet::tool::AxisFrame {
+                    pressure: evt.pressure_has_changed().then(|| evt.pressure()),
+                    distance: evt.distance_has_changed().then(|| evt.distance()),
+                    tilt: evt.tilt_has_changed().then(|| evt.tilt()),
+                    rotation: evt.rotation_has_changed().then(|| evt.rotation()),
+                    slider: evt.slider_has_changed().then(|| evt.slider_position()),
+                    wheel: evt
+                        .wheel_has_changed()
+                        .then(|| (evt.wheel_delta(), evt.wheel_delta_discrete())),
+                };
+
+                tool.axis(self, frame);
 
                 tool.motion(
-                    pointer_location,
-                    under.and_then(|(f, loc)| f.wl_surface().map(|s| (s.into_owned(), loc))),
-                    &tablet,
-                    SCOUNTER.next_serial(),
-                    evt.time_msec(),
+                    self,
+                    under,
+                    &tablet::tool::MotionEvent {
+                        location: pointer_location,
+                        serial: SCOUNTER.next_serial(),
+                        time,
+                    },
                 );
+
+                tool.frame(self, time);
             }
 
             pointer.frame(self);
@@ -984,12 +1211,13 @@ impl AnvilState<UdevData> {
 
         if let Some(pointer_location) = self.touch_location_transformed(&evt) {
             let tool = evt.tool();
-            tablet_seat.add_tool::<Self>(self, dh, &tool);
 
             let pointer = self.pointer.clone();
             let under = self.surface_under(pointer_location);
             let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&evt.device()));
-            let tool = tablet_seat.get_tool(&tool);
+            let tool = tablet_seat
+                .get_tool(&tool)
+                .unwrap_or_else(|| tablet_seat.add_wp_tool(self, dh, &tool));
 
             pointer.motion(
                 self,
@@ -997,26 +1225,52 @@ impl AnvilState<UdevData> {
                 &MotionEvent {
                     location: pointer_location,
                     serial: SCOUNTER.next_serial(),
-                    time: evt.time_msec(),
+                    time: evt.time(),
                 },
             );
             pointer.frame(self);
 
-            if let (Some(under), Some(tablet), Some(tool)) = (
-                under.and_then(|(f, loc)| f.wl_surface().map(|s| (s.into_owned(), loc))),
-                tablet,
-                tool,
-            ) {
+            if let Some(tablet) = tablet {
+                let frame = tablet::tool::AxisFrame {
+                    pressure: evt.pressure_has_changed().then(|| evt.pressure()),
+                    distance: evt.distance_has_changed().then(|| evt.distance()),
+                    tilt: evt.tilt_has_changed().then(|| evt.tilt()),
+                    rotation: evt.rotation_has_changed().then(|| evt.rotation()),
+                    slider: evt.slider_has_changed().then(|| evt.slider_position()),
+                    wheel: evt
+                        .wheel_has_changed()
+                        .then(|| (evt.wheel_delta(), evt.wheel_delta_discrete())),
+                };
+
                 match evt.state() {
-                    ProximityState::In => tool.proximity_in(
-                        pointer_location,
-                        under,
-                        &tablet,
-                        SCOUNTER.next_serial(),
-                        evt.time_msec(),
-                    ),
-                    ProximityState::Out => tool.proximity_out(evt.time_msec()),
+                    ProximityState::In => {
+                        tool.proximity_in(
+                            self,
+                            under,
+                            tablet,
+                            &tablet::tool::ProximityInEvent {
+                                location: pointer_location,
+                                axis: Some(frame),
+                                serial: SCOUNTER.next_serial(),
+                                time: evt.time(),
+                            },
+                        );
+                    }
+                    ProximityState::Out => {
+                        tool.proximity_out(
+                            self,
+                            &tablet::tool::ProximityOutEvent {
+                                serial: SCOUNTER.next_serial(),
+                                time: evt.time(),
+                            },
+                        );
+                    }
                 }
+
+                // Doing this in an idle handler would allow other events (e.g. buttons) to be
+                // sent as part of the same frame, which is closer to what the protocol
+                // expect, and let well behaved clients accumulate events.
+                tool.frame(self, evt.time());
             }
         }
     }
@@ -1025,18 +1279,33 @@ impl AnvilState<UdevData> {
         let tool = self.seat.tablet_seat().get_tool(&evt.tool());
 
         if let Some(tool) = tool {
+            let serial = SCOUNTER.next_serial();
+
             match evt.tip_state() {
                 TabletToolTipState::Down => {
-                    let serial = SCOUNTER.next_serial();
-                    tool.tip_down(serial, evt.time_msec());
+                    tool.down(
+                        self,
+                        &tablet::tool::DownEvent {
+                            serial,
+                            time: evt.time(),
+                        },
+                    );
 
                     // change the keyboard focus
                     self.update_keyboard_focus(self.pointer.current_location(), serial);
                 }
                 TabletToolTipState::Up => {
-                    tool.tip_up(evt.time_msec());
+                    tool.up(
+                        self,
+                        &tablet::tool::UpEvent {
+                            serial,
+                            time: evt.time(),
+                        },
+                    );
                 }
             }
+
+            tool.frame(self, evt.time());
         }
     }
 
@@ -1045,205 +1314,17 @@ impl AnvilState<UdevData> {
 
         if let Some(tool) = tool {
             tool.button(
-                evt.button(),
-                evt.button_state(),
-                SCOUNTER.next_serial(),
-                evt.time_msec(),
+                self,
+                &tablet::tool::ButtonEvent {
+                    serial: SCOUNTER.next_serial(),
+                    button: evt.button(),
+                    state: evt.button_state(),
+                    time: evt.time(),
+                },
             );
+
+            tool.frame(self, evt.time());
         }
-    }
-
-    fn on_gesture_swipe_begin<B: InputBackend>(&mut self, evt: B::GestureSwipeBeginEvent) {
-        let serial = SCOUNTER.next_serial();
-        let pointer = self.pointer.clone();
-        pointer.gesture_swipe_begin(
-            self,
-            &GestureSwipeBeginEvent {
-                serial,
-                time: evt.time_msec(),
-                fingers: evt.fingers(),
-            },
-        );
-    }
-
-    fn on_gesture_swipe_update<B: InputBackend>(&mut self, evt: B::GestureSwipeUpdateEvent) {
-        let pointer = self.pointer.clone();
-        pointer.gesture_swipe_update(
-            self,
-            &GestureSwipeUpdateEvent {
-                time: evt.time_msec(),
-                delta: evt.delta(),
-            },
-        );
-    }
-
-    fn on_gesture_swipe_end<B: InputBackend>(&mut self, evt: B::GestureSwipeEndEvent) {
-        let serial = SCOUNTER.next_serial();
-        let pointer = self.pointer.clone();
-        pointer.gesture_swipe_end(
-            self,
-            &GestureSwipeEndEvent {
-                serial,
-                time: evt.time_msec(),
-                cancelled: evt.cancelled(),
-            },
-        );
-    }
-
-    fn on_gesture_pinch_begin<B: InputBackend>(&mut self, evt: B::GesturePinchBeginEvent) {
-        let serial = SCOUNTER.next_serial();
-        let pointer = self.pointer.clone();
-        pointer.gesture_pinch_begin(
-            self,
-            &GesturePinchBeginEvent {
-                serial,
-                time: evt.time_msec(),
-                fingers: evt.fingers(),
-            },
-        );
-    }
-
-    fn on_gesture_pinch_update<B: InputBackend>(&mut self, evt: B::GesturePinchUpdateEvent) {
-        let pointer = self.pointer.clone();
-        pointer.gesture_pinch_update(
-            self,
-            &GesturePinchUpdateEvent {
-                time: evt.time_msec(),
-                delta: evt.delta(),
-                scale: evt.scale(),
-                rotation: evt.rotation(),
-            },
-        );
-    }
-
-    fn on_gesture_pinch_end<B: InputBackend>(&mut self, evt: B::GesturePinchEndEvent) {
-        let serial = SCOUNTER.next_serial();
-        let pointer = self.pointer.clone();
-        pointer.gesture_pinch_end(
-            self,
-            &GesturePinchEndEvent {
-                serial,
-                time: evt.time_msec(),
-                cancelled: evt.cancelled(),
-            },
-        );
-    }
-
-    fn on_gesture_hold_begin<B: InputBackend>(&mut self, evt: B::GestureHoldBeginEvent) {
-        let serial = SCOUNTER.next_serial();
-        let pointer = self.pointer.clone();
-        pointer.gesture_hold_begin(
-            self,
-            &GestureHoldBeginEvent {
-                serial,
-                time: evt.time_msec(),
-                fingers: evt.fingers(),
-            },
-        );
-    }
-
-    fn on_gesture_hold_end<B: InputBackend>(&mut self, evt: B::GestureHoldEndEvent) {
-        let serial = SCOUNTER.next_serial();
-        let pointer = self.pointer.clone();
-        pointer.gesture_hold_end(
-            self,
-            &GestureHoldEndEvent {
-                serial,
-                time: evt.time_msec(),
-                cancelled: evt.cancelled(),
-            },
-        );
-    }
-
-    fn touch_location_transformed<B: InputBackend, E: AbsolutePositionEvent<B>>(
-        &self,
-        evt: &E,
-    ) -> Option<Point<f64, Logical>> {
-        let output = self
-            .space
-            .outputs()
-            .find(|output| output.name().starts_with("eDP"))
-            .or_else(|| self.space.outputs().next());
-
-        let output = output?;
-        let output_geometry = self.space.output_geometry(output)?;
-
-        let transform = output.current_transform();
-        let size = transform.invert().transform_size(output_geometry.size);
-        Some(
-            transform.transform_point_in(evt.position_transformed(size), &size.to_f64())
-                + output_geometry.loc.to_f64(),
-        )
-    }
-
-    fn on_touch_down<B: InputBackend>(&mut self, evt: B::TouchDownEvent) {
-        let Some(handle) = self.seat.get_touch() else {
-            return;
-        };
-
-        let Some(touch_location) = self.touch_location_transformed(&evt) else {
-            return;
-        };
-
-        let serial = SCOUNTER.next_serial();
-        self.update_keyboard_focus(touch_location, serial);
-
-        let under = self.surface_under(touch_location);
-        handle.down(
-            self,
-            under,
-            &DownEvent {
-                slot: evt.slot(),
-                location: touch_location,
-                serial,
-                time: evt.time_msec(),
-            },
-        );
-    }
-    fn on_touch_up<B: InputBackend>(&mut self, evt: B::TouchUpEvent) {
-        let Some(handle) = self.seat.get_touch() else {
-            return;
-        };
-        let serial = SCOUNTER.next_serial();
-        handle.up(
-            self,
-            &UpEvent {
-                slot: evt.slot(),
-                serial,
-                time: evt.time_msec(),
-            },
-        )
-    }
-    fn on_touch_motion<B: InputBackend>(&mut self, evt: B::TouchMotionEvent) {
-        let Some(handle) = self.seat.get_touch() else {
-            return;
-        };
-        let Some(touch_location) = self.touch_location_transformed(&evt) else {
-            return;
-        };
-
-        let under = self.surface_under(touch_location);
-        handle.motion(
-            self,
-            under,
-            &smithay::input::touch::MotionEvent {
-                slot: evt.slot(),
-                location: touch_location,
-                time: evt.time_msec(),
-            },
-        );
-    }
-    fn on_touch_frame<B: InputBackend>(&mut self, _evt: B::TouchFrameEvent) {
-        let Some(handle) = self.seat.get_touch() else {
-            return;
-        };
-        handle.frame(self);
-    }
-    fn on_touch_cancel<B: InputBackend>(&mut self, _evt: B::TouchCancelEvent) {
-        let Some(handle) = self.seat.get_touch() else {
-            return;
-        };
-        handle.cancel(self);
     }
 
     fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
@@ -1327,5 +1408,50 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::ToggleDecorations)
     } else {
         None
+    }
+}
+
+impl<BackendData: Backend> VirtualKeyboardHandler for AnvilState<BackendData> {
+    fn process_virtual_keyboard_event(&mut self, event: InputEvent<VirtualKeyboardBackend>) {
+        let keyboard = self.seat.get_keyboard().unwrap();
+
+        match event {
+            // The device's keycodes only mean anything under its own keymap, so
+            // activate it before processing events. Anvil never switches back;
+            // a real compositor should track which device the seat keymap came
+            // from and restore its configured one when a physical key arrives.
+            InputEvent::DeviceAdded { device }
+            | InputEvent::Special(VirtualKeyboardSpecialEvent::KeymapChanged { device }) => {
+                let Some(keymap) = device.keymap() else {
+                    return;
+                };
+                if let Err(err) = keyboard.set_keymap_from_keymap_file(self, keymap) {
+                    warn!(?err, "Failed to apply virtual keyboard keymap");
+                }
+            }
+            InputEvent::Keyboard { event } => {
+                match self.keyboard_key_to_action::<VirtualKeyboardBackend>(event) {
+                    action @ (KeyAction::None
+                    | KeyAction::Quit
+                    | KeyAction::Run(_)
+                    | KeyAction::TogglePreview
+                    | KeyAction::ToggleDecorations) => self.process_common_key_action(action),
+                    // VT switching and output changes are out-of-scope for virtual keyboards.
+                    action => debug!(?action, "ignoring key action from a virtual keyboard"),
+                }
+            }
+            InputEvent::Special(VirtualKeyboardSpecialEvent::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            }) => {
+                keyboard.with_xkb_state(self, |mut context| {
+                    context.set_modifier_mask(mods_depressed, mods_latched, mods_locked, group)
+                });
+            }
+            _ => (),
+        }
     }
 }

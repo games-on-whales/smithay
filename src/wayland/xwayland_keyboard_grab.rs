@@ -5,7 +5,6 @@
 //!     XWaylandKeyboardGrabHandler,
 //!     XWaylandKeyboardGrabState
 //! };
-//! use smithay::delegate_xwayland_keyboard_grab;
 //!
 //! # struct State;
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
@@ -14,8 +13,15 @@
 //!     &display.handle(), // the display
 //! );
 //! #
+//! # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
 //! # use smithay::input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus};
 //! # use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+//! # use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
+//! # impl CompositorHandler for State {
+//! #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+//! #     fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState { unimplemented!() }
+//! #     fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+//! # }
 //! # impl SeatHandler for State {
 //! #     type KeyboardFocus = WlSurface;
 //! #     type PointerFocus = WlSurface;
@@ -24,6 +30,7 @@
 //! #     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) { unimplemented!() }
 //! #     fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) { unimplemented!() }
 //! # }
+//! # impl PointerConstraintsHandler for State {}
 //!
 //! impl XWaylandKeyboardGrabHandler for State {
 //!     fn keyboard_focus_for_xsurface(&self, _: &WlSurface) -> Option<Self::KeyboardFocus> {
@@ -34,7 +41,7 @@
 //! }
 //!
 //! // implement Dispatch for the keyboard grab types
-//! delegate_xwayland_keyboard_grab!(State);
+//! smithay::delegate_dispatch2!(State);
 //! ```
 
 use wayland_protocols::xwayland::keyboard_grab::zv1::server::{
@@ -42,17 +49,18 @@ use wayland_protocols::xwayland::keyboard_grab::zv1::server::{
     zwp_xwayland_keyboard_grab_v1::{self, ZwpXwaylandKeyboardGrabV1},
 };
 use wayland_server::{
-    backend::GlobalId, protocol::wl_surface, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New,
-    Resource,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, backend::GlobalId,
+    protocol::wl_surface,
 };
 
 use crate::{
-    backend::input::{KeyState, Keycode},
+    backend::input::{InputTime, KeyState, Keycode},
     input::{
-        keyboard::{self, KeyboardGrab, KeyboardInnerHandle},
         Seat, SeatHandler,
+        keyboard::{self, KeyboardGrab, KeyboardInnerHandle},
     },
-    utils::{Serial, SERIAL_COUNTER},
+    utils::{SERIAL_COUNTER, Serial},
+    wayland::{Dispatch2, GlobalData, GlobalDispatch2},
     xwayland::XWaylandClientData,
 };
 
@@ -112,7 +120,7 @@ impl<D: XWaylandKeyboardGrabHandler + 'static> KeyboardGrab<D> for XWaylandKeybo
         state: KeyState,
         modifiers: Option<keyboard::ModifiersState>,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         handle.set_focus(data, self.start_data.focus.clone(), serial);
 
@@ -153,12 +161,13 @@ impl XWaylandKeyboardGrabState {
     /// Register new [ZwpXwaylandKeyboardGrabManagerV1] global
     pub fn new<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<ZwpXwaylandKeyboardGrabManagerV1, ()>,
-        D: Dispatch<ZwpXwaylandKeyboardGrabManagerV1, ()>,
-        D: Dispatch<ZwpXwaylandKeyboardGrabV1, ()>,
+        D: GlobalDispatch<ZwpXwaylandKeyboardGrabManagerV1, GlobalData>,
+        D: Dispatch<ZwpXwaylandKeyboardGrabManagerV1, GlobalData>,
+        D: Dispatch<ZwpXwaylandKeyboardGrabV1, GlobalData>,
         D: 'static,
     {
-        let global = display.create_global::<D, ZwpXwaylandKeyboardGrabManagerV1, _>(MANAGER_VERSION, ());
+        let global =
+            display.create_global::<D, ZwpXwaylandKeyboardGrabManagerV1, _>(MANAGER_VERSION, GlobalData);
 
         Self { global }
     }
@@ -169,46 +178,43 @@ impl XWaylandKeyboardGrabState {
     }
 }
 
-impl<D> GlobalDispatch<ZwpXwaylandKeyboardGrabManagerV1, (), D> for XWaylandKeyboardGrabState
+impl<D> GlobalDispatch2<ZwpXwaylandKeyboardGrabManagerV1, D> for GlobalData
 where
-    D: GlobalDispatch<ZwpXwaylandKeyboardGrabManagerV1, ()>
-        + Dispatch<ZwpXwaylandKeyboardGrabManagerV1, ()>
-        + 'static,
+    D: Dispatch<ZwpXwaylandKeyboardGrabManagerV1, GlobalData> + 'static,
 {
     fn bind(
+        &self,
         _state: &mut D,
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<ZwpXwaylandKeyboardGrabManagerV1>,
-        _global_data: &(),
         data_init: &mut DataInit<'_, D>,
     ) {
-        data_init.init(resource, ());
+        data_init.init(resource, GlobalData);
     }
 
-    fn can_view(client: Client, _global_data: &()) -> bool {
+    fn can_view(&self, client: &Client) -> bool {
         client.get_data::<XWaylandClientData>().is_some()
     }
 }
 
-impl<D> Dispatch<ZwpXwaylandKeyboardGrabManagerV1, (), D> for XWaylandKeyboardGrabState
+impl<D> Dispatch2<ZwpXwaylandKeyboardGrabManagerV1, D> for GlobalData
 where
-    D: Dispatch<ZwpXwaylandKeyboardGrabManagerV1, ()> + 'static,
-    D: Dispatch<ZwpXwaylandKeyboardGrabV1, ()> + 'static,
+    D: Dispatch<ZwpXwaylandKeyboardGrabV1, GlobalData> + 'static,
     D: XWaylandKeyboardGrabHandler,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &wayland_server::Client,
         _grab_manager: &ZwpXwaylandKeyboardGrabManagerV1,
         request: zwp_xwayland_keyboard_grab_manager_v1::Request,
-        _data: &(),
         _dh: &DisplayHandle,
         data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
         match request {
             zwp_xwayland_keyboard_grab_manager_v1::Request::GrabKeyboard { id, surface, seat } => {
-                let grab = data_init.init(id, ());
+                let grab = data_init.init(id, GlobalData);
                 if let Some(focus) = state.keyboard_focus_for_xsurface(&surface) {
                     let grab = XWaylandKeyboardGrab {
                         grab,
@@ -224,16 +230,13 @@ where
     }
 }
 
-impl<D> Dispatch<ZwpXwaylandKeyboardGrabV1, (), D> for XWaylandKeyboardGrabState
-where
-    D: Dispatch<ZwpXwaylandKeyboardGrabV1, ()> + 'static,
-{
+impl<D> Dispatch2<ZwpXwaylandKeyboardGrabV1, D> for GlobalData {
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _grab: &ZwpXwaylandKeyboardGrabV1,
         request: zwp_xwayland_keyboard_grab_v1::Request,
-        _data: &(),
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -242,20 +245,4 @@ where
             _ => unreachable!(),
         }
     }
-}
-
-/// Macro to delegate implementation of the xwayland keyboard grab protocol
-#[macro_export]
-macro_rules! delegate_xwayland_keyboard_grab {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xwayland::keyboard_grab::zv1::server::zwp_xwayland_keyboard_grab_manager_v1::ZwpXwaylandKeyboardGrabManagerV1: ()
-        ] => $crate::wayland::xwayland_keyboard_grab::XWaylandKeyboardGrabState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xwayland::keyboard_grab::zv1::server::zwp_xwayland_keyboard_grab_manager_v1::ZwpXwaylandKeyboardGrabManagerV1: ()
-        ] => $crate::wayland::xwayland_keyboard_grab::XWaylandKeyboardGrabState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xwayland::keyboard_grab::zv1::server::zwp_xwayland_keyboard_grab_v1::ZwpXwaylandKeyboardGrabV1: ()
-        ] => $crate::wayland::xwayland_keyboard_grab::XWaylandKeyboardGrabState);
-    };
 }

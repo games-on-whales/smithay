@@ -13,8 +13,8 @@ use crate::backend::{
         gbm::{GbmBuffer, GbmConvertError},
     },
     drm::{
-        gbm::{framebuffer_from_bo, framebuffer_from_dmabuf, Error as GbmError, GbmFramebuffer},
         DrmDeviceFd,
+        gbm::{Error as GbmError, GbmFramebuffer, framebuffer_from_bo, framebuffer_from_dmabuf},
     },
 };
 
@@ -95,16 +95,19 @@ impl<A: AsFd + 'static> ExportFramebuffer<GbmBuffer> for GbmFramebufferExporter<
     fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, GbmBuffer>) -> bool {
         match buffer {
             #[cfg(not(all(feature = "backend_egl", feature = "use_system_lib")))]
-            ExportBuffer::Wayland(buffer) => crate::wayland::dmabuf::get_dmabuf(buffer)
-                .ok()
-                .is_some_and(|buf| buf.node().is_some_and(|node| self.import_node == node)),
+            ExportBuffer::Wayland(buffer) => {
+                let node = crate::wayland::dmabuf::get_dmabuf(buffer)
+                    .ok()
+                    .and_then(|buf| buf.node());
+                self.import_node == node
+            }
             #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
             ExportBuffer::Wayland(buffer) => match crate::backend::renderer::buffer_type(buffer) {
-                Some(crate::backend::renderer::BufferType::Dma) => crate::wayland::dmabuf::get_dmabuf(buffer)
-                    .unwrap()
-                    .node()
-                    .is_some_and(|node| self.import_node == node),
-                // Argubly we need specialization here. If the renderer (which we have in `element_config`, which calls this function)
+                Some(crate::backend::renderer::BufferType::Dma) => {
+                    let node = crate::wayland::dmabuf::get_dmabuf(buffer).unwrap().node();
+                    self.import_node == node
+                }
+                // Arguably we need specialization here. If the renderer (which we have in `element_config`, which calls this function)
                 // has `ImportEGL`, we can verify that `EGLBufferRender` is some, which means we have the renderer advertised via wl_drm,
                 // which means this is probably fine.
                 // If we don't have `ImportEGL` or `EGLBufferReader` is none, we should reject this, but we don't want to require `ImportEGL`.
@@ -138,12 +141,12 @@ pub enum NodeFilter {
     Node(DrmNode),
 }
 
-impl PartialEq<DrmNode> for NodeFilter {
-    fn eq(&self, other: &DrmNode) -> bool {
+impl PartialEq<Option<DrmNode>> for NodeFilter {
+    fn eq(&self, other: &Option<DrmNode>) -> bool {
         match self {
             Self::None => false,
             Self::All => true,
-            Self::Node(node) => node == other,
+            Self::Node(node) => other.is_some_and(|n| &n == node),
         }
     }
 }

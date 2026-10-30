@@ -30,7 +30,6 @@
 //! ```
 //! # extern crate wayland_server;
 //! # #[macro_use] extern crate smithay;
-//! use smithay::delegate_compositor;
 //! use smithay::wayland::compositor::{CompositorState, CompositorClientState, CompositorHandler};
 //!
 //! # struct State { compositor_state: CompositorState }
@@ -52,7 +51,7 @@
 //!    }
 //!
 //!    fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState {
-//!        &client.get_data::<ClientState>().unwrap().compositor_state    
+//!        &client.get_data::<ClientState>().unwrap().compositor_state
 //!    }
 //!
 //!    fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {
@@ -60,7 +59,8 @@
 //!        // .. your implementation ..
 //!    }
 //! }
-//! delegate_compositor!(State);
+//!
+//! smithay::delegate_dispatch2!(State);
 //!
 //! // You're now ready to go!
 //! ```
@@ -111,8 +111,8 @@ mod transaction;
 mod tree;
 
 use std::cell::RefCell;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::{any::Any, sync::Mutex};
 
 pub use self::cache::{Cacheable, CachedState, MultiCache};
@@ -121,10 +121,12 @@ use self::transaction::TransactionQueue;
 pub use self::transaction::{Barrier, Blocker, BlockerState};
 pub use self::tree::{AlreadyHasRole, TraversalAction};
 use self::tree::{PrivateSurfaceData, SuggestedSurfaceState};
-pub use crate::utils::hook::HookId;
+use crate::input::touch::FrameMarker;
 use crate::utils::Transform;
-use crate::utils::{user_data::UserDataMap, Buffer, Logical, Point, Rectangle};
-use atomic_float::AtomicF64;
+pub use crate::utils::hook::HookId;
+use crate::utils::{Buffer, Logical, Point, Rectangle, user_data::UserDataMap};
+use crate::wayland::GlobalData;
+use portable_atomic::AtomicF64;
 use wayland_server::backend::GlobalId;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
@@ -526,17 +528,17 @@ where
 }
 
 /// Unregister a pre-commit hook
-pub fn remove_pre_commit_hook(surface: &WlSurface, hook_id: HookId) {
+pub fn remove_pre_commit_hook(surface: &WlSurface, hook_id: &HookId) {
     PrivateSurfaceData::remove_pre_commit_hook(surface, hook_id)
 }
 
 /// Unregister a post-commit hook
-pub fn remove_post_commit_hook(surface: &WlSurface, hook_id: HookId) {
+pub fn remove_post_commit_hook(surface: &WlSurface, hook_id: &HookId) {
     PrivateSurfaceData::remove_post_commit_hook(surface, hook_id)
 }
 
 /// Unregister a destruction hook
-pub fn remove_destruction_hook(surface: &WlSurface, hook_id: HookId) {
+pub fn remove_destruction_hook(surface: &WlSurface, hook_id: &HookId) {
     PrivateSurfaceData::remove_destruction_hook(surface, hook_id)
 }
 
@@ -599,6 +601,10 @@ pub trait CompositorHandler {
     /// The surface was destroyed.
     ///
     /// This allows the compositor to clean up any uses of the surface.
+    ///
+    /// Note: Destruction might happen explicitly by the client, or implicitly
+    /// when the client quits. In case of implicit destruction the order the
+    /// callbacks are called in is undefined.
     fn destroyed(&mut self, _surface: &WlSurface) {}
 }
 
@@ -615,6 +621,7 @@ pub struct CompositorState {
 pub struct CompositorClientState {
     queue: Mutex<Option<TransactionQueue>>,
     scale_override: Arc<AtomicF64>,
+    last_touch_frame: Mutex<Option<FrameMarker>>,
 }
 
 impl Default for CompositorClientState {
@@ -622,6 +629,7 @@ impl Default for CompositorClientState {
         CompositorClientState {
             queue: Mutex::new(None),
             scale_override: Arc::new(AtomicF64::new(1.)),
+            last_touch_frame: Mutex::new(None),
         }
     }
 }
@@ -667,6 +675,14 @@ impl CompositorClientState {
     pub(crate) fn clone_client_scale(&self) -> Arc<AtomicF64> {
         self.scale_override.clone()
     }
+
+    pub(crate) fn set_last_touch_frame(&self, frame_marker: FrameMarker) {
+        *self.last_touch_frame.lock().unwrap() = Some(frame_marker);
+    }
+
+    pub(crate) fn last_touch_frame(&self) -> Option<FrameMarker> {
+        *self.last_touch_frame.lock().unwrap()
+    }
 }
 
 impl CompositorState {
@@ -679,7 +695,7 @@ impl CompositorState {
     /// [`wl_subcompositor`]: wayland_server::protocol::wl_subcompositor
     pub fn new<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<WlCompositor, ()> + GlobalDispatch<WlSubcompositor, ()> + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
         Self::new_with_version::<D>(display, 5)
     }
@@ -693,17 +709,17 @@ impl CompositorState {
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
     pub fn new_v6<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<WlCompositor, ()> + GlobalDispatch<WlSubcompositor, ()> + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
         Self::new_with_version::<D>(display, 6)
     }
 
     fn new_with_version<D>(display: &DisplayHandle, version: u32) -> Self
     where
-        D: GlobalDispatch<WlCompositor, ()> + GlobalDispatch<WlSubcompositor, ()> + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
-        let compositor = display.create_global::<D, WlCompositor, ()>(version, ());
-        let subcompositor = display.create_global::<D, WlSubcompositor, ()>(1, ());
+        let compositor = display.create_global::<D, WlCompositor, _>(version, GlobalData);
+        let subcompositor = display.create_global::<D, WlSubcompositor, _>(1, GlobalData);
 
         CompositorState {
             compositor,
@@ -721,39 +737,6 @@ impl CompositorState {
     pub fn subcompositor_global(&self) -> GlobalId {
         self.subcompositor.clone()
     }
-}
-
-#[allow(missing_docs)] // TODO
-#[macro_export]
-macro_rules! delegate_compositor {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_compositor::WlCompositor: ()
-        ] => $crate::wayland::compositor::CompositorState);
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor: ()
-        ] => $crate::wayland::compositor::CompositorState);
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_compositor::WlCompositor: ()
-        ] => $crate::wayland::compositor::CompositorState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_surface::WlSurface: $crate::wayland::compositor::SurfaceUserData
-        ] => $crate::wayland::compositor::CompositorState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_region::WlRegion: $crate::wayland::compositor::RegionUserData
-        ] => $crate::wayland::compositor::CompositorState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_callback::WlCallback: ()
-        ] => $crate::wayland::compositor::CompositorState);
-            // WlSubcompositor
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor: ()
-        ] => $crate::wayland::compositor::CompositorState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_subsurface::WlSubsurface: $crate::wayland::compositor::SubsurfaceUserData
-        ] => $crate::wayland::compositor::CompositorState);
-    };
 }
 
 #[cfg(test)]

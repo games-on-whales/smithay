@@ -1,10 +1,10 @@
 use smithay::{
     backend::renderer::{
-        element::{
-            solid::{SolidColorBuffer, SolidColorRenderElement},
-            AsRenderElements, Kind,
-        },
         Renderer,
+        element::{
+            AsRenderElements, Kind,
+            solid::{SolidColorBuffer, SolidColorRenderElement},
+        },
     },
     desktop::WindowSurface,
     input::Seat,
@@ -14,7 +14,7 @@ use smithay::{
 
 use std::cell::{RefCell, RefMut};
 
-use crate::{state::Backend, AnvilState};
+use crate::{AnvilState, state::Backend};
 
 use super::WindowElement;
 
@@ -141,7 +141,6 @@ impl HeaderBar {
         _seat: &Seat<AnvilState<BackendData>>,
         state: &mut AnvilState<BackendData>,
         window: &WindowElement,
-        _serial: Serial,
     ) {
         match self.pointer_loc.as_ref() {
             Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {

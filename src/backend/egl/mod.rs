@@ -84,7 +84,7 @@ impl ::std::error::Error for EglExtensionNotSupportedError {}
 pub unsafe fn get_proc_address(symbol: &str) -> *const c_void {
     let addr = CString::new(symbol.as_bytes()).unwrap();
     let addr = addr.as_ptr();
-    ffi::egl::GetProcAddress(addr) as *const _
+    unsafe { ffi::egl::GetProcAddress(addr) as *const _ }
 }
 
 /// Error that can occur when accessing an EGL buffer
@@ -185,7 +185,7 @@ impl From<MakeCurrentError> for GraphicsSwapBuffersError {
             From khronos docs:
                 If the previous context of the calling thread has unflushed commands, and the previous surface is no longer valid, an EGL_BAD_CURRENT_SURFACE error is generated.
 
-            This does not consern this or future `makeCurrent`-calls.
+            This does not concern this or future `makeCurrent`-calls.
             */
             x @ MakeCurrentError(EGLError::BadCurrentSurface) => {
                 GraphicsSwapBuffersError::TemporaryFailure(Box::new(x))
@@ -260,7 +260,7 @@ impl EGLBuffer {
 
     /// Returns the underlying images
     pub fn into_images(mut self) -> Vec<EGLImage> {
-        self.images.drain(..).collect()
+        std::mem::take(&mut self.images)
     }
 }
 

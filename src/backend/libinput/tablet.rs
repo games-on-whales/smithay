@@ -1,10 +1,11 @@
 use crate::backend::input::{
-    self as backend, TabletToolCapabilities, TabletToolDescriptor, TabletToolTipState, TabletToolType,
+    self as backend, InputTime, TabletToolCapabilities, TabletToolDescriptor, TabletToolTipState,
+    TabletToolType,
 };
 
 use input as libinput;
 use input::event;
-use input::event::{tablet_tool, EventTrait};
+use input::event::{EventTrait, tablet_tool};
 
 use super::LibinputInputBackend;
 
@@ -20,8 +21,8 @@ impl<E> backend::Event<LibinputInputBackend> for E
 where
     E: IsTabletEvent,
 {
-    fn time(&self) -> u64 {
-        tablet_tool::TabletToolEventTrait::time_usec(self)
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(tablet_tool::TabletToolEventTrait::time_usec(self))
     }
 
     fn device(&self) -> libinput::Device {
@@ -170,7 +171,7 @@ where
     }
 
     fn wheel_delta_discrete(&self) -> i32 {
-        // I have no idea why f64 is returend by this fn, in libinput's api wheel clicks are always i32
+        // I have no idea why f64 is returned by this fn, in libinput's api wheel clicks are always i32
         tablet_tool::TabletToolEventTrait::wheel_delta_discrete(self) as i32
     }
 

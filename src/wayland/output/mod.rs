@@ -21,8 +21,6 @@
 //! ```
 //! # extern crate wayland_server;
 //! # extern crate smithay;
-//! use smithay::delegate_output;
-//! # use smithay::delegate_compositor;
 //! use smithay::output::{Output, PhysicalProperties, Scale, Mode, Subpixel};
 //! use smithay::utils::Transform;
 //! use smithay::wayland::output::OutputHandler;
@@ -40,6 +38,7 @@
 //!         subpixel: Subpixel::HorizontalRgb,  // subpixel information
 //!         make: "Screens Inc".into(),     // make of the monitor
 //!         model: "Monitor Ultra".into(),  // model of the monitor
+//!         serial_number: "KL11C28J04XJ".into(), // serial number of the monitor
 //!     },
 //! );
 //! // create a global, if you want to advertise it to clients
@@ -66,34 +65,37 @@
 //! #     fn commit(&mut self, surface: &WlSurface) {}
 //! # }
 //!
-//! delegate_output!(State);
-//! # delegate_compositor!(State);
+//! smithay::delegate_dispatch2!(State);
 //! ```
 
 mod handlers;
 pub(crate) mod xdg;
 
 use std::mem;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{Arc, atomic::Ordering};
 
 use crate::{
     output::{Inner, Mode, Output, Scale, Subpixel, WeakOutput},
     utils::iter::new_locked_obj_iter,
 };
 
-use atomic_float::AtomicF64;
+use portable_atomic::AtomicF64;
 use tracing::info;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
+use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_v1::ZxdgOutputV1;
 use wayland_server::{
+    Client, DisplayHandle, GlobalDispatch, Resource,
     backend::{ClientId, GlobalId},
     protocol::{
         wl_output::{Mode as WMode, Subpixel as WlSubpixel, Transform, WlOutput},
         wl_surface,
     },
-    Client, DisplayHandle, GlobalDispatch, Resource,
 };
 
-use crate::utils::{Logical, Point};
+use crate::{
+    utils::{Logical, Point},
+    wayland::GlobalData,
+};
 
 pub use self::handlers::XdgOutputUserData;
 
@@ -127,10 +129,10 @@ impl OutputManagerState {
     pub fn new_with_xdg_output<D>(display: &DisplayHandle) -> Self
     where
         D: GlobalDispatch<WlOutput, WlOutputData>,
-        D: GlobalDispatch<ZxdgOutputManagerV1, ()>,
+        D: GlobalDispatch<ZxdgOutputManagerV1, GlobalData>,
         D: 'static,
     {
-        let xdg_output_manager = display.create_global::<D, ZxdgOutputManagerV1, _>(3, ());
+        let xdg_output_manager = display.create_global::<D, ZxdgOutputManagerV1, _>(3, GlobalData);
 
         Self {
             xdg_output_manager: Some(xdg_output_manager),
@@ -269,6 +271,26 @@ impl Output {
             .any(|o| o.id() == output.id())
     }
 
+    /// Check if given [`xdg_output`](ZxdgOutputV1) instance is managed by this [`Output`].
+    pub fn owns_xdg_output(&self, output: &ZxdgOutputV1) -> bool {
+        self.inner
+            .0
+            .lock()
+            .unwrap()
+            .xdg_output
+            .as_ref()
+            .map(|xdg_output| {
+                xdg_output
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .instances
+                    .iter()
+                    .any(|o| o.id() == output.id())
+            })
+            .unwrap_or(false)
+    }
+
     /// This function returns all managed [WlOutput] matching the provided [Client]
     pub fn client_outputs<'a>(&'a self, client: &Client) -> impl Iterator<Item = WlOutput> + 'a {
         self.client_outputs_internal(client.id())
@@ -349,27 +371,4 @@ impl Output {
         let mut inner = self.inner.0.lock().unwrap();
         inner.surfaces.retain(|s| s.is_alive());
     }
-}
-
-#[allow(missing_docs)] // TODO
-#[macro_export]
-macro_rules! delegate_output {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_output::WlOutput: $crate::wayland::output::WlOutputData
-        ] => $crate::wayland::output::OutputManagerState);
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1: ()
-        ] => $crate::wayland::output::OutputManagerState);
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_output::WlOutput: $crate::wayland::output::OutputUserData
-        ] => $crate::wayland::output::OutputManagerState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_v1::ZxdgOutputV1: $crate::wayland::output::XdgOutputUserData
-        ] => $crate::wayland::output::OutputManagerState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1: ()
-        ] => $crate::wayland::output::OutputManagerState);
-    };
 }

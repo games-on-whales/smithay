@@ -47,6 +47,7 @@ fn gl_generate() {
                 "EGL_KHR_fence_sync",
                 "EGL_ANDROID_native_fence_sync",
                 "EGL_IMG_context_priority",
+                "EGL_NV_context_priority_realtime",
             ],
         )
         .write_bindings(gl_generator::GlobalGenerator, &mut file)
@@ -66,6 +67,7 @@ fn gl_generate() {
                 "GL_EXT_texture_format_BGRA8888",
                 "GL_EXT_unpack_subimage",
                 "GL_OES_EGL_sync",
+                "GL_EXT_disjoint_timer_query",
             ],
         )
         .write_bindings(gl_generator::StructGenerator, &mut file)

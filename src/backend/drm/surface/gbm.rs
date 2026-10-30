@@ -1,22 +1,22 @@
 use std::os::unix::io::AsFd;
 use std::sync::Arc;
 
-use drm::control::{connector, crtc, plane, Mode};
+use drm::control::{Mode, connector, crtc, plane};
 use drm::{Device, DriverCapability};
 use indexmap::IndexSet;
 
+use crate::backend::SwapBuffersError;
 use crate::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use crate::backend::allocator::format::get_opaque;
 use crate::backend::allocator::gbm::{GbmBuffer, GbmConvertError};
 use crate::backend::allocator::{Allocator, Format, Fourcc, Modifier, Slot, Swapchain};
 use crate::backend::drm::error::AccessError;
-use crate::backend::drm::gbm::{framebuffer_from_bo, GbmFramebuffer};
-use crate::backend::drm::{plane_has_property, DrmError, DrmSurface};
+use crate::backend::drm::gbm::{GbmFramebuffer, framebuffer_from_bo};
+use crate::backend::drm::{DrmError, DrmSurface, plane_has_property};
 use crate::backend::renderer::sync::SyncPoint;
-use crate::backend::SwapBuffersError;
 use crate::utils::{DevPath, Physical, Rectangle, Transform};
 
-use tracing::{debug, error, info_span, instrument, trace, warn};
+use tracing::{debug, info_span, instrument, trace, warn};
 
 use super::{PlaneConfig, PlaneDamageClips, PlaneState, VrrSupport};
 
@@ -212,7 +212,7 @@ where
             Ok(dmabuf) => dmabuf,
             Err(err) => return Err((swapchain.allocator, err.into())),
         };
-        buffer.userdata().insert_if_missing(|| fb);
+        buffer.userdata().insert_if_missing_threadsafe(|| fb);
 
         let handle = buffer.userdata().get::<GbmFramebuffer>().unwrap();
 
@@ -231,7 +231,7 @@ where
 
         match drm.test_state([plane_state], true) {
             Ok(_) => {
-                debug!("Choosen format: {:?}", format);
+                debug!("Chosen format: {:?}", format);
                 Ok((buffer, swapchain, use_opaque))
             }
             Err(err) => {
@@ -266,7 +266,7 @@ where
             if maybe_buffer.is_none() {
                 let fb = framebuffer_from_bo(self.drm.device_fd(), &slot, self.is_opaque)
                     .map_err(|err| Error::DrmError(err.into()))?;
-                slot.userdata().insert_if_missing(|| fb);
+                slot.userdata().insert_if_missing_threadsafe(|| fb);
             }
 
             self.next_fb = Some(slot);
@@ -349,9 +349,16 @@ where
         let dst = Rectangle::from_size((mode.size().0 as i32, mode.size().1 as i32).into());
 
         let damage_clips = damage.and_then(|damage| {
-            PlaneDamageClips::from_damage(self.drm.device_fd(), src, dst, damage)
-                .ok()
-                .flatten()
+            PlaneDamageClips::from_damage(
+                self.drm.device_fd(),
+                src,
+                dst,
+                Transform::Normal,
+                Transform::Normal,
+                damage,
+            )
+            .ok()
+            .flatten()
         });
 
         // Try to extract a native fence out of the supplied sync point if any
@@ -543,10 +550,10 @@ pub enum Error<E: std::error::Error + Send + Sync + 'static> {
     #[error("Failed to render test frame")]
     InitialRenderingError,
     /// Error accessing the drm device
-    #[error("The underlying drm surface encounted an error: {0}")]
+    #[error("The underlying drm surface encountered an error: {0}")]
     DrmError(#[from] DrmError),
     /// Error importing the rendered buffer to libgbm for scan-out
-    #[error("The underlying gbm device encounted an error: {0}")]
+    #[error("The underlying gbm device encountered an error: {0}")]
     GbmError(#[source] E),
     /// Error exporting as Dmabuf
     #[error("The allocated buffer could not be exported as a dmabuf: {0}")]

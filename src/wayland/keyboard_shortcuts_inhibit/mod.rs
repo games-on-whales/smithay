@@ -10,15 +10,18 @@ use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::server::{
     zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
 };
 use wayland_server::{
+    Dispatch, DisplayHandle, GlobalDispatch, Resource,
     backend::{GlobalId, ObjectId},
     protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
-    Dispatch, DisplayHandle, GlobalDispatch, Resource,
 };
 
 mod dispatch;
 pub use dispatch::KeyboardShortcutsInhibitorUserData;
 
-use crate::input::{Seat, SeatHandler};
+use crate::{
+    input::{Seat, SeatHandler},
+    wayland::GlobalData,
+};
 
 type SeatId = ObjectId;
 
@@ -68,12 +71,13 @@ impl KeyboardShortcutsInhibitState {
     /// Regiseter new [ZwpKeyboardShortcutsInhibitManagerV1] global
     pub fn new<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()>,
-        D: Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()>,
+        D: GlobalDispatch<ZwpKeyboardShortcutsInhibitManagerV1, GlobalData>,
+        D: Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, GlobalData>,
         D: Dispatch<ZwpKeyboardShortcutsInhibitorV1, KeyboardShortcutsInhibitorUserData>,
         D: 'static,
     {
-        let manager_global = display.create_global::<D, ZwpKeyboardShortcutsInhibitManagerV1, _>(1, ());
+        let manager_global =
+            display.create_global::<D, ZwpKeyboardShortcutsInhibitManagerV1, _>(1, GlobalData);
         Self {
             manager_global,
             inhibitors: HashMap::new(),
@@ -101,17 +105,17 @@ impl KeyboardShortcutsInhibitor {
         self.data().is_active.store(v, atomic::Ordering::Release);
     }
 
-    /// Seat that is beeing inhibited
+    /// Seat that is being inhibited
     fn seat_id(&self) -> &SeatId {
         &self.data().seat
     }
 
-    /// Seat that is beeing inhibited
+    /// Seat that is being inhibited
     pub fn seat(&self, dh: &DisplayHandle) -> Option<WlSeat> {
         WlSeat::from_id(dh, self.seat_id().clone()).ok()
     }
 
-    /// Seat that is beeing inhibited
+    /// Seat that is being inhibited
     #[inline]
     pub fn wl_surface(&self) -> &WlSurface {
         &self.data().surface
@@ -177,10 +181,17 @@ pub trait KeyboardShortcutsInhibitorSeat {
     /// Can be used to check if certain surface has inhibitor on it
     /// ```no_run
     /// use smithay::input::Seat;
+    /// # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
     /// use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat;
     /// # use smithay::input::{SeatHandler, SeatState, pointer::CursorImageStatus};
     /// # use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+    /// # use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
     /// # struct State;
+    /// # impl CompositorHandler for State {
+    /// #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+    /// #     fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState { unimplemented!() }
+    /// #     fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+    /// # }
     /// # impl SeatHandler for State {
     /// #     type KeyboardFocus = WlSurface;
     /// #     type PointerFocus = WlSurface;
@@ -189,6 +200,7 @@ pub trait KeyboardShortcutsInhibitorSeat {
     /// #     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) { unimplemented!() }
     /// #     fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) { unimplemented!() }
     /// # }
+    /// # impl PointerConstraintsHandler for State {}
     ///
     /// # let wl_surface: WlSurface = todo!();
     ///
@@ -233,25 +245,6 @@ pub trait KeyboardShortcutsInhibitHandler {
     /// You may also postpone activation based on your compositor specific policy.
     fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {}
 
-    /// Inhibitor got destoryed
+    /// Inhibitor got destroyed
     fn inhibitor_destroyed(&mut self, inhibitor: KeyboardShortcutsInhibitor) {}
-}
-
-/// Macro to delegate implementation of the keyboard shortcuts inhibit protocol
-///
-/// You must also implement [`KeyboardShortcutsInhibitHandler`] to use this.
-#[macro_export]
-macro_rules! delegate_keyboard_shortcuts_inhibit {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::server::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1: ()
-        ] => $crate::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState);
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::server::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1: ()
-        ] => $crate::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::server::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1: $crate::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorUserData
-        ] => $crate::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState);
-    };
 }

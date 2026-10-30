@@ -1,12 +1,12 @@
 use std::{
     collections::HashMap,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
 use smithay::{
     backend::{
-        input::ButtonState,
+        input::{ButtonState, InputTime},
         renderer::{
             damage::OutputDamageTracker,
             element::AsRenderElements,
@@ -19,16 +19,16 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
-            channel::{Channel, Event as ChannelEvent},
             EventLoop,
+            channel::{Channel, Event as ChannelEvent},
         },
-        wayland_server::{protocol::wl_surface, Client, Display, Resource},
+        wayland_server::{Client, Display, Resource, protocol::wl_surface},
     },
-    utils::{IsAlive, Scale, SERIAL_COUNTER as SCOUNTER},
+    utils::{IsAlive, SERIAL_COUNTER as SCOUNTER, Scale},
     wayland::compositor,
 };
 
-use anvil::{drawing::PointerElement, render::*, state::Backend, AnvilState, ClientState};
+use anvil::{AnvilState, ClientState, drawing::PointerElement, render::*, state::Backend};
 
 use crate::WlcsEvent;
 
@@ -66,7 +66,7 @@ pub fn run(channel: Channel<WlcsEvent>) {
         })
         .unwrap();
 
-    let mut renderer = DummyRenderer::default();
+    let mut renderer = DummyRenderer;
     let mut framebuffer = DummyFramebuffer;
 
     let mode = Mode {
@@ -81,6 +81,7 @@ pub fn run(channel: Channel<WlcsEvent>) {
             subpixel: Subpixel::Unknown,
             make: "Smithay".into(),
             model: "WLCS".into(),
+            serial_number: "Unknown".into(),
         },
     );
     let _global = output.create_global::<AnvilState<TestState>>(&state.display_handle);
@@ -217,7 +218,7 @@ fn handle_event(event: WlcsEvent, state: &mut AnvilState<TestState>) {
         WlcsEvent::PointerMoveAbsolute { location, .. } => {
             let serial = SCOUNTER.next_serial();
             let under = state.surface_under(location);
-            let time = Duration::from(state.clock.now()).as_millis() as u32;
+            let time = InputTime::now();
             let ptr = state.pointer.clone();
             ptr.motion(
                 state,
@@ -234,8 +235,7 @@ fn handle_event(event: WlcsEvent, state: &mut AnvilState<TestState>) {
             let pointer_location = state.pointer.current_location() + delta;
             let serial = SCOUNTER.next_serial();
             let under = state.surface_under(pointer_location);
-            let time = Duration::from(state.clock.now()).as_millis() as u32;
-            let utime = Duration::from(state.clock.now()).as_micros() as u64;
+            let time = InputTime::now();
             let ptr = state.pointer.clone();
             ptr.motion(
                 state,
@@ -252,7 +252,7 @@ fn handle_event(event: WlcsEvent, state: &mut AnvilState<TestState>) {
                 &RelativeMotionEvent {
                     delta,
                     delta_unaccel: delta,
-                    utime,
+                    time,
                 },
             );
             ptr.frame(state);
@@ -274,7 +274,7 @@ fn handle_event(event: WlcsEvent, state: &mut AnvilState<TestState>) {
                     .unwrap()
                     .set_focus(state, under.map(Into::into), serial);
             }
-            let time = Duration::from(state.clock.now()).as_millis() as u32;
+            let time = InputTime::now();
             ptr.button(
                 state,
                 &ButtonEvent {
@@ -288,7 +288,7 @@ fn handle_event(event: WlcsEvent, state: &mut AnvilState<TestState>) {
         }
         WlcsEvent::PointerButtonUp { button_id, .. } => {
             let serial = SCOUNTER.next_serial();
-            let time = Duration::from(state.clock.now()).as_millis() as u32;
+            let time = InputTime::now();
             let ptr = state.seat.get_pointer().unwrap();
             ptr.button(
                 state,

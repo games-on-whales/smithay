@@ -1,32 +1,39 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::X11Surface;
+#[cfg(feature = "xwayland")]
+use smithay::xwayland::xwm::XwmOfferData;
 pub use smithay::{
-    backend::input::KeyState,
+    backend::input::{InputTime, KeyState},
     desktop::{LayerSurface, PopupKind},
     input::{
+        Seat,
         keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerTarget, RelativeMotionEvent},
-        Seat,
     },
-    reexports::wayland_server::{backend::ObjectId, protocol::wl_surface::WlSurface, Resource},
+    reexports::wayland_server::{Resource, backend::ObjectId, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Serial},
     wayland::seat::WaylandFocus,
 };
 use smithay::{
     desktop::{Window, WindowSurface},
     input::{
+        dnd::{DndFocus, OfferData, Source},
         pointer::{
             GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
             GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
         },
-        touch::TouchTarget,
+        tablet::tool::TabletToolTarget,
+        touch::{FrameMarker, TouchTarget},
     },
+    reexports::wayland_server::DisplayHandle,
+    utils::{Logical, Point},
+    wayland::selection::data_device::WlOfferData,
 };
 
 use crate::{
-    shell::{WindowElement, SSD},
+    shell::{SSD, WindowElement},
     state::{AnvilState, Backend},
 };
 
@@ -50,6 +57,7 @@ impl IsAlive for KeyboardFocusTarget {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum PointerFocusTarget {
     WlSurface(WlSurface),
     #[cfg(feature = "xwayland")]
@@ -76,6 +84,51 @@ impl From<PointerFocusTarget> for WlSurface {
     }
 }
 
+impl KeyboardFocusTarget {
+    fn inner_keyboard_target<BackendData: Backend>(&self) -> &dyn KeyboardTarget<AnvilState<BackendData>> {
+        match self {
+            Self::Window(w) => match w.underlying_surface() {
+                WindowSurface::Wayland(w) => w.wl_surface(),
+                #[cfg(feature = "xwayland")]
+                WindowSurface::X11(s) => s,
+            },
+            Self::LayerSurface(l) => l.wl_surface(),
+            Self::Popup(p) => p.wl_surface(),
+        }
+    }
+}
+
+impl PointerFocusTarget {
+    fn inner_pointer_target<BackendData: Backend>(&self) -> &dyn PointerTarget<AnvilState<BackendData>> {
+        match self {
+            Self::WlSurface(w) => w,
+            #[cfg(feature = "xwayland")]
+            Self::X11Surface(w) => w,
+            Self::SSD(w) => w,
+        }
+    }
+
+    fn inner_touch_target<BackendData: Backend>(&self) -> &dyn TouchTarget<AnvilState<BackendData>> {
+        match self {
+            Self::WlSurface(w) => w,
+            #[cfg(feature = "xwayland")]
+            Self::X11Surface(w) => w,
+            Self::SSD(w) => w,
+        }
+    }
+
+    fn inner_tablet_tool_target<BackendData: Backend>(
+        &self,
+    ) -> &dyn TabletToolTarget<AnvilState<BackendData>> {
+        match self {
+            Self::WlSurface(w) => w,
+            #[cfg(feature = "xwayland")]
+            Self::X11Surface(w) => w,
+            Self::SSD(w) => w,
+        }
+    }
+}
+
 impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFocusTarget {
     fn enter(
         &self,
@@ -83,12 +136,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &MotionEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::enter(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::enter(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::enter(w, seat, data, event),
-        }
+        self.inner_pointer_target().enter(seat, data, event)
     }
     fn motion(
         &self,
@@ -96,12 +144,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &MotionEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::motion(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::motion(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::motion(w, seat, data, event),
-        }
+        self.inner_pointer_target().motion(seat, data, event)
     }
     fn relative_motion(
         &self,
@@ -109,12 +152,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &RelativeMotionEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::relative_motion(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::relative_motion(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::relative_motion(w, seat, data, event),
-        }
+        self.inner_pointer_target().relative_motion(seat, data, event)
     }
     fn button(
         &self,
@@ -122,12 +160,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &ButtonEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::button(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::button(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::button(w, seat, data, event),
-        }
+        self.inner_pointer_target().button(seat, data, event)
     }
     fn axis(
         &self,
@@ -135,34 +168,19 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         frame: AxisFrame,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::axis(w, seat, data, frame),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::axis(w, seat, data, frame),
-            PointerFocusTarget::SSD(w) => PointerTarget::axis(w, seat, data, frame),
-        }
+        self.inner_pointer_target().axis(seat, data, frame)
     }
     fn frame(&self, seat: &Seat<AnvilState<BackendData>>, data: &mut AnvilState<BackendData>) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::frame(w, seat, data),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::frame(w, seat, data),
-            PointerFocusTarget::SSD(w) => PointerTarget::frame(w, seat, data),
-        }
+        self.inner_pointer_target().frame(seat, data)
     }
     fn leave(
         &self,
         seat: &Seat<AnvilState<BackendData>>,
         data: &mut AnvilState<BackendData>,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::leave(w, seat, data, serial, time),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::leave(w, seat, data, serial, time),
-            PointerFocusTarget::SSD(w) => PointerTarget::leave(w, seat, data, serial, time),
-        }
+        self.inner_pointer_target().leave(seat, data, serial, time)
     }
     fn gesture_swipe_begin(
         &self,
@@ -170,12 +188,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &GestureSwipeBeginEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::gesture_swipe_begin(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::gesture_swipe_begin(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::gesture_swipe_begin(w, seat, data, event),
-        }
+        self.inner_pointer_target().gesture_swipe_begin(seat, data, event)
     }
     fn gesture_swipe_update(
         &self,
@@ -183,12 +196,8 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &GestureSwipeUpdateEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::gesture_swipe_update(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::gesture_swipe_update(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::gesture_swipe_update(w, seat, data, event),
-        }
+        self.inner_pointer_target()
+            .gesture_swipe_update(seat, data, event)
     }
     fn gesture_swipe_end(
         &self,
@@ -196,12 +205,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &GestureSwipeEndEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::gesture_swipe_end(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::gesture_swipe_end(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::gesture_swipe_end(w, seat, data, event),
-        }
+        self.inner_pointer_target().gesture_swipe_end(seat, data, event)
     }
     fn gesture_pinch_begin(
         &self,
@@ -209,12 +213,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &GesturePinchBeginEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::gesture_pinch_begin(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::gesture_pinch_begin(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::gesture_pinch_begin(w, seat, data, event),
-        }
+        self.inner_pointer_target().gesture_pinch_begin(seat, data, event)
     }
     fn gesture_pinch_update(
         &self,
@@ -222,12 +221,8 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &GesturePinchUpdateEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::gesture_pinch_update(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::gesture_pinch_update(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::gesture_pinch_update(w, seat, data, event),
-        }
+        self.inner_pointer_target()
+            .gesture_pinch_update(seat, data, event)
     }
     fn gesture_pinch_end(
         &self,
@@ -235,12 +230,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &GesturePinchEndEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::gesture_pinch_end(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::gesture_pinch_end(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::gesture_pinch_end(w, seat, data, event),
-        }
+        self.inner_pointer_target().gesture_pinch_end(seat, data, event)
     }
     fn gesture_hold_begin(
         &self,
@@ -248,12 +238,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &GestureHoldBeginEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::gesture_hold_begin(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::gesture_hold_begin(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::gesture_hold_begin(w, seat, data, event),
-        }
+        self.inner_pointer_target().gesture_hold_begin(seat, data, event)
     }
     fn gesture_hold_end(
         &self,
@@ -261,12 +246,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for PointerFoc
         data: &mut AnvilState<BackendData>,
         event: &GestureHoldEndEvent,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => PointerTarget::gesture_hold_end(w, seat, data, event),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => PointerTarget::gesture_hold_end(w, seat, data, event),
-            PointerFocusTarget::SSD(w) => PointerTarget::gesture_hold_end(w, seat, data, event),
-        }
+        self.inner_pointer_target().gesture_hold_end(seat, data, event)
     }
 }
 
@@ -278,17 +258,7 @@ impl<BackendData: Backend> KeyboardTarget<AnvilState<BackendData>> for KeyboardF
         keys: Vec<KeysymHandle<'_>>,
         serial: Serial,
     ) {
-        match self {
-            KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => KeyboardTarget::enter(w.wl_surface(), seat, data, keys, serial),
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
-            },
-            KeyboardFocusTarget::LayerSurface(l) => {
-                KeyboardTarget::enter(l.wl_surface(), seat, data, keys, serial)
-            }
-            KeyboardFocusTarget::Popup(p) => KeyboardTarget::enter(p.wl_surface(), seat, data, keys, serial),
-        }
+        self.inner_keyboard_target().enter(seat, data, keys, serial)
     }
     fn leave(
         &self,
@@ -296,15 +266,7 @@ impl<BackendData: Backend> KeyboardTarget<AnvilState<BackendData>> for KeyboardF
         data: &mut AnvilState<BackendData>,
         serial: Serial,
     ) {
-        match self {
-            KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => KeyboardTarget::leave(w.wl_surface(), seat, data, serial),
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(s) => KeyboardTarget::leave(s, seat, data, serial),
-            },
-            KeyboardFocusTarget::LayerSurface(l) => KeyboardTarget::leave(l.wl_surface(), seat, data, serial),
-            KeyboardFocusTarget::Popup(p) => KeyboardTarget::leave(p.wl_surface(), seat, data, serial),
-        }
+        self.inner_keyboard_target().leave(seat, data, serial)
     }
     fn key(
         &self,
@@ -313,23 +275,10 @@ impl<BackendData: Backend> KeyboardTarget<AnvilState<BackendData>> for KeyboardF
         key: KeysymHandle<'_>,
         state: KeyState,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
-        match self {
-            KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    KeyboardTarget::key(w.wl_surface(), seat, data, key, state, serial, time)
-                }
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(s) => KeyboardTarget::key(s, seat, data, key, state, serial, time),
-            },
-            KeyboardFocusTarget::LayerSurface(l) => {
-                KeyboardTarget::key(l.wl_surface(), seat, data, key, state, serial, time)
-            }
-            KeyboardFocusTarget::Popup(p) => {
-                KeyboardTarget::key(p.wl_surface(), seat, data, key, state, serial, time)
-            }
-        }
+        self.inner_keyboard_target()
+            .key(seat, data, key, state, serial, time)
     }
     fn modifiers(
         &self,
@@ -338,21 +287,8 @@ impl<BackendData: Backend> KeyboardTarget<AnvilState<BackendData>> for KeyboardF
         modifiers: ModifiersState,
         serial: Serial,
     ) {
-        match self {
-            KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    KeyboardTarget::modifiers(w.wl_surface(), seat, data, modifiers, serial)
-                }
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(s) => KeyboardTarget::modifiers(s, seat, data, modifiers, serial),
-            },
-            KeyboardFocusTarget::LayerSurface(l) => {
-                KeyboardTarget::modifiers(l.wl_surface(), seat, data, modifiers, serial)
-            }
-            KeyboardFocusTarget::Popup(p) => {
-                KeyboardTarget::modifiers(p.wl_surface(), seat, data, modifiers, serial)
-            }
-        }
+        self.inner_keyboard_target()
+            .modifiers(seat, data, modifiers, serial)
     }
 }
 
@@ -362,14 +298,8 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for PointerFocus
         seat: &Seat<AnvilState<BackendData>>,
         data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::DownEvent,
-        seq: Serial,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => TouchTarget::down(w, seat, data, event, seq),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => TouchTarget::down(w, seat, data, event, seq),
-            PointerFocusTarget::SSD(w) => TouchTarget::down(w, seat, data, event, seq),
-        }
+        self.inner_touch_target().down(seat, data, event)
     }
 
     fn up(
@@ -377,14 +307,8 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for PointerFocus
         seat: &Seat<AnvilState<BackendData>>,
         data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::UpEvent,
-        seq: Serial,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => TouchTarget::up(w, seat, data, event, seq),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => TouchTarget::up(w, seat, data, event, seq),
-            PointerFocusTarget::SSD(w) => TouchTarget::up(w, seat, data, event, seq),
-        }
+        self.inner_touch_target().up(seat, data, event)
     }
 
     fn motion(
@@ -392,32 +316,26 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for PointerFocus
         seat: &Seat<AnvilState<BackendData>>,
         data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::MotionEvent,
-        seq: Serial,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => TouchTarget::motion(w, seat, data, event, seq),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => TouchTarget::motion(w, seat, data, event, seq),
-            PointerFocusTarget::SSD(w) => TouchTarget::motion(w, seat, data, event, seq),
-        }
+        self.inner_touch_target().motion(seat, data, event)
     }
 
-    fn frame(&self, seat: &Seat<AnvilState<BackendData>>, data: &mut AnvilState<BackendData>, seq: Serial) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => TouchTarget::frame(w, seat, data, seq),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => TouchTarget::frame(w, seat, data, seq),
-            PointerFocusTarget::SSD(w) => TouchTarget::frame(w, seat, data, seq),
-        }
+    fn frame(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        marker: FrameMarker,
+    ) {
+        self.inner_touch_target().frame(seat, data, marker)
     }
 
-    fn cancel(&self, seat: &Seat<AnvilState<BackendData>>, data: &mut AnvilState<BackendData>, seq: Serial) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => TouchTarget::cancel(w, seat, data, seq),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => TouchTarget::cancel(w, seat, data, seq),
-            PointerFocusTarget::SSD(w) => TouchTarget::cancel(w, seat, data, seq),
-        }
+    fn cancel(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        marker: FrameMarker,
+    ) {
+        self.inner_touch_target().cancel(seat, data, marker)
     }
 
     fn shape(
@@ -425,14 +343,8 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for PointerFocus
         seat: &Seat<AnvilState<BackendData>>,
         data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::ShapeEvent,
-        seq: Serial,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => TouchTarget::shape(w, seat, data, event, seq),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => TouchTarget::shape(w, seat, data, event, seq),
-            PointerFocusTarget::SSD(w) => TouchTarget::shape(w, seat, data, event, seq),
-        }
+        self.inner_touch_target().shape(seat, data, event)
     }
 
     fn orientation(
@@ -440,14 +352,106 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for PointerFocus
         seat: &Seat<AnvilState<BackendData>>,
         data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::OrientationEvent,
-        seq: Serial,
     ) {
-        match self {
-            PointerFocusTarget::WlSurface(w) => TouchTarget::orientation(w, seat, data, event, seq),
-            #[cfg(feature = "xwayland")]
-            PointerFocusTarget::X11Surface(w) => TouchTarget::orientation(w, seat, data, event, seq),
-            PointerFocusTarget::SSD(w) => TouchTarget::orientation(w, seat, data, event, seq),
-        }
+        self.inner_touch_target().orientation(seat, data, event)
+    }
+
+    fn last_frame(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+    ) -> Option<FrameMarker> {
+        self.inner_touch_target().last_frame(seat, data)
+    }
+}
+
+impl<BackendData: Backend> TabletToolTarget<AnvilState<BackendData>> for PointerFocusTarget {
+    fn proximity_in(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        tablet: &smithay::input::tablet::Tablet,
+        serial: Serial,
+    ) {
+        self.inner_tablet_tool_target()
+            .proximity_in(seat, data, tool_descriptor, tablet, serial);
+    }
+
+    fn proximity_out(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+    ) {
+        self.inner_tablet_tool_target()
+            .proximity_out(seat, data, tool_descriptor);
+    }
+
+    fn down(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        event: &smithay::input::tablet::tool::DownEvent,
+    ) {
+        self.inner_tablet_tool_target()
+            .down(seat, data, tool_descriptor, event);
+    }
+
+    fn up(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        event: &smithay::input::tablet::tool::UpEvent,
+    ) {
+        self.inner_tablet_tool_target()
+            .up(seat, data, tool_descriptor, event);
+    }
+
+    fn motion(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        event: &smithay::input::tablet::tool::MotionEvent,
+    ) {
+        self.inner_tablet_tool_target()
+            .motion(seat, data, tool_descriptor, event);
+    }
+
+    fn button(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        event: &smithay::input::tablet::tool::ButtonEvent,
+    ) {
+        self.inner_tablet_tool_target()
+            .button(seat, data, tool_descriptor, event);
+    }
+
+    fn axis(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        frame: smithay::input::tablet::tool::AxisFrame,
+    ) {
+        self.inner_tablet_tool_target()
+            .axis(seat, data, tool_descriptor, frame);
+    }
+
+    fn frame(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        time: InputTime,
+    ) {
+        self.inner_tablet_tool_target()
+            .frame(seat, data, tool_descriptor, time);
     }
 }
 
@@ -482,6 +486,154 @@ impl WaylandFocus for KeyboardFocusTarget {
             KeyboardFocusTarget::Window(w) => w.wl_surface(),
             KeyboardFocusTarget::LayerSurface(l) => Some(Cow::Borrowed(l.wl_surface())),
             KeyboardFocusTarget::Popup(p) => Some(Cow::Borrowed(p.wl_surface())),
+        }
+    }
+}
+
+pub enum AnvilOfferData<S: Source> {
+    Wayland(WlOfferData<S>),
+    #[cfg(feature = "xwayland")]
+    X11(XwmOfferData<S>),
+}
+
+impl<S: Source> OfferData for AnvilOfferData<S> {
+    fn disable(&self) {
+        match self {
+            AnvilOfferData::Wayland(data) => data.disable(),
+            #[cfg(feature = "xwayland")]
+            AnvilOfferData::X11(data) => data.disable(),
+        }
+    }
+
+    fn drop(&self) {
+        match self {
+            AnvilOfferData::Wayland(data) => data.drop(),
+            #[cfg(feature = "xwayland")]
+            AnvilOfferData::X11(data) => data.drop(),
+        }
+    }
+
+    fn validated(&self) -> bool {
+        match self {
+            AnvilOfferData::Wayland(data) => data.validated(),
+            #[cfg(feature = "xwayland")]
+            AnvilOfferData::X11(data) => data.validated(),
+        }
+    }
+}
+
+#[allow(unreachable_patterns)]
+impl<BackendData: Backend> DndFocus<AnvilState<BackendData>> for PointerFocusTarget {
+    type OfferData<S>
+        = AnvilOfferData<S>
+    where
+        S: Source;
+
+    fn enter<S: Source>(
+        &self,
+        data: &mut AnvilState<BackendData>,
+        dh: &DisplayHandle,
+        source: Arc<S>,
+        seat: &Seat<AnvilState<BackendData>>,
+        location: Point<f64, Logical>,
+        serial: &Serial,
+    ) -> Option<AnvilOfferData<S>> {
+        match self {
+            PointerFocusTarget::WlSurface(surface) => {
+                DndFocus::enter(surface, data, dh, source, seat, location, serial)
+                    .map(AnvilOfferData::Wayland)
+            }
+            #[cfg(feature = "xwayland")]
+            PointerFocusTarget::X11Surface(surface) => {
+                DndFocus::enter(surface, data, dh, source, seat, location, serial).map(AnvilOfferData::X11)
+            }
+            _ => None,
+        }
+    }
+
+    fn motion<S: Source>(
+        &self,
+        data: &mut AnvilState<BackendData>,
+        offer: Option<&mut AnvilOfferData<S>>,
+        seat: &Seat<AnvilState<BackendData>>,
+        location: Point<f64, Logical>,
+        time: InputTime,
+    ) {
+        match self {
+            PointerFocusTarget::WlSurface(surface) => {
+                let offer = match offer {
+                    Some(AnvilOfferData::Wayland(offer)) => Some(offer),
+                    None => None,
+                    _ => return,
+                };
+                DndFocus::motion(surface, data, offer, seat, location, time)
+            }
+            #[cfg(feature = "xwayland")]
+            PointerFocusTarget::X11Surface(surface) => {
+                let offer = match offer {
+                    Some(AnvilOfferData::X11(offer)) => Some(offer),
+                    None => None,
+                    _ => return,
+                };
+                DndFocus::motion(surface, data, offer, seat, location, time)
+            }
+            _ => {}
+        }
+    }
+
+    fn leave<S: Source>(
+        &self,
+        data: &mut AnvilState<BackendData>,
+        offer: Option<&mut AnvilOfferData<S>>,
+        seat: &Seat<AnvilState<BackendData>>,
+    ) {
+        match self {
+            PointerFocusTarget::WlSurface(surface) => {
+                let offer = match offer {
+                    Some(AnvilOfferData::Wayland(offer)) => Some(offer),
+                    None => None,
+                    _ => return,
+                };
+                DndFocus::leave(surface, data, offer, seat)
+            }
+            #[cfg(feature = "xwayland")]
+            PointerFocusTarget::X11Surface(surface) => {
+                let offer = match offer {
+                    Some(AnvilOfferData::X11(offer)) => Some(offer),
+                    None => None,
+                    _ => return,
+                };
+                DndFocus::leave(surface, data, offer, seat)
+            }
+            _ => {}
+        }
+    }
+
+    fn drop<S: Source>(
+        &self,
+        data: &mut AnvilState<BackendData>,
+        offer: Option<&mut AnvilOfferData<S>>,
+        seat: &Seat<AnvilState<BackendData>>,
+    ) {
+        match self {
+            PointerFocusTarget::WlSurface(surface) => {
+                let offer = match offer {
+                    Some(AnvilOfferData::Wayland(offer)) => Some(offer),
+                    None => None,
+                    _ => return,
+                };
+                DndFocus::drop(surface, data, offer, seat)
+            }
+            #[cfg(feature = "xwayland")]
+            PointerFocusTarget::X11Surface(surface) => {
+                let offer = match offer {
+                    Some(AnvilOfferData::X11(offer)) => Some(offer),
+                    None => None,
+                    _ => return,
+                };
+                DndFocus::drop(surface, data, offer, seat)
+            }
+            _ => {}
         }
     }
 }

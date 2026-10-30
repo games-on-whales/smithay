@@ -37,8 +37,11 @@
 //! See also `anvil/src/udev.rs` for pure hardware backed example of a compositor utilizing this
 //! backend.
 
+#[cfg(feature = "backend_drm")]
+use drm::node::{DrmNode, NodeType};
 use libc::dev_t;
 use rustix::fs::stat;
+use std::ops::{Deref, DerefMut};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -46,7 +49,7 @@ use std::{
     os::unix::io::{AsFd, BorrowedFd},
     path::{Path, PathBuf},
 };
-use udev::{Enumerator, EventType, MonitorBuilder, MonitorSocket};
+use udev::{Device, Enumerator, EventType, MonitorBuilder, MonitorSocket};
 
 use calloop::{EventSource, Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
 
@@ -58,7 +61,7 @@ use tracing::{debug, debug_span, info, warn};
 /// given handler of any changes. Can be used to provide hot-plug functionality for gpus and
 /// attached monitors.
 pub struct UdevBackend {
-    devices: HashMap<dev_t, PathBuf>,
+    devices: UdevDevices,
     monitor: MonitorSocket,
     token: Option<Token>,
     span: tracing::Span,
@@ -102,6 +105,7 @@ impl UdevBackend {
                 }
             })
             .collect();
+        let devices = UdevDevices(devices);
 
         let monitor = MonitorBuilder::new()?.match_subsystem("drm")?.listen()?;
 
@@ -119,13 +123,13 @@ impl UdevBackend {
     /// You should call this once before inserting the event source into your
     /// event loop, to get an initial snapshot of the device state.
     pub fn device_list(&self) -> impl Iterator<Item = (dev_t, &Path)> {
-        self.devices.iter().map(|(&id, path)| (id, path.as_ref()))
+        self.devices.device_list()
     }
 }
 
 impl EventSource for UdevBackend {
     type Event = UdevEvent;
-    type Metadata = ();
+    type Metadata = UdevDevices;
     type Ret = ();
     type Error = io::Error;
 
@@ -137,7 +141,7 @@ impl EventSource for UdevBackend {
         mut callback: F,
     ) -> std::io::Result<PostAction>
     where
-        F: FnMut(UdevEvent, &mut ()),
+        F: FnMut(Self::Event, &mut Self::Metadata),
     {
         if Some(token) != self.token {
             return Ok(PostAction::Continue);
@@ -162,7 +166,7 @@ impl EventSource for UdevBackend {
                                     device_id: devnum,
                                     path: path.to_path_buf(),
                                 },
-                                &mut (),
+                                &mut self.devices,
                             );
                         }
                     }
@@ -172,7 +176,7 @@ impl EventSource for UdevBackend {
                     if let Some(devnum) = event.devnum() {
                         info!("Device removed: #{}", devnum);
                         if self.devices.remove(&devnum).is_some() {
-                            callback(UdevEvent::Removed { device_id: devnum }, &mut ());
+                            callback(UdevEvent::Removed { device_id: devnum }, &mut self.devices);
                         }
                     }
                 }
@@ -181,7 +185,7 @@ impl EventSource for UdevBackend {
                     if let Some(devnum) = event.devnum() {
                         info!("Device changed: #{}", devnum);
                         if self.devices.contains_key(&devnum) {
-                            callback(UdevEvent::Changed { device_id: devnum }, &mut ());
+                            callback(UdevEvent::Changed { device_id: devnum }, &mut self.devices);
                         }
                     }
                 }
@@ -205,6 +209,34 @@ impl EventSource for UdevBackend {
     fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
         self.token = None;
         poll.unregister(self.as_fd())
+    }
+}
+
+/// Udev DRM devices.
+#[derive(Debug)]
+pub struct UdevDevices(HashMap<dev_t, PathBuf>);
+
+impl UdevDevices {
+    /// Get a list of DRM devices currently known to the backend
+    ///
+    /// You should call this once before inserting the event source into your
+    /// event loop, to get an initial snapshot of the device state.
+    pub fn device_list(&self) -> impl Iterator<Item = (dev_t, &Path)> {
+        self.0.iter().map(|(&id, path)| (id, path.as_ref()))
+    }
+}
+
+impl Deref for UdevDevices {
+    type Target = HashMap<dev_t, PathBuf>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for UdevDevices {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -235,33 +267,49 @@ pub enum UdevEvent {
 /// Might be used for filtering of [`UdevEvent::Added`] or for manual
 /// [`DrmDevice`](crate::backend::drm::DrmDevice) initialization.
 pub fn primary_gpu<S: AsRef<str>>(seat: S) -> io::Result<Option<PathBuf>> {
-    let mut enumerator = Enumerator::new()?;
-    enumerator.match_subsystem("drm")?;
-    enumerator.match_sysname("card[0-9]*")?;
+    let gpu_devices = gpus_for_seat(seat)?;
 
-    if let Some(path) = enumerator
-        .scan_devices()?
-        .filter(|device| {
-            let seat_name = device
-                .property_value("ID_SEAT")
-                .map(|x| x.to_os_string())
-                .unwrap_or_else(|| OsString::from("seat0"));
-            if seat_name == *seat.as_ref() {
-                if let Ok(Some(pci)) = device.parent_with_subsystem(Path::new("pci")) {
-                    if let Some(id) = pci.attribute_value("boot_vga") {
-                        return id == "1";
-                    }
-                }
+    fn has_boot_vga(device: &Device) -> bool {
+        if let Ok(Some(pci)) = device.parent_with_subsystem(Path::new("pci")) {
+            if let Some(id) = pci.attribute_value("boot_vga") {
+                return id == "1";
             }
-            false
-        })
+        }
+        false
+    }
+
+    // 1st priority: GPU with boot_vga=1
+    if let Some(path) = gpu_devices
+        .iter()
+        .filter(|device| has_boot_vga(device))
         .flat_map(|device| device.devnode().map(PathBuf::from))
         .next()
     {
-        Ok(Some(path))
-    } else {
-        all_gpus(seat).map(|all| all.into_iter().next())
+        return Ok(Some(path));
     }
+
+    let gpu_paths = {
+        let mut gpu_paths = gpu_devices
+            .into_iter()
+            .flat_map(|device| device.devnode().map(PathBuf::from))
+            .collect::<Vec<_>>();
+        gpu_paths.sort();
+        gpu_paths
+    };
+
+    // 2nd priority: GPU with a render node
+    #[cfg(feature = "backend_drm")]
+    if let Some(path) = gpu_paths.iter().find(|path| {
+        DrmNode::from_path(path)
+            .ok()
+            .and_then(|node| node.node_with_type(NodeType::Render))
+            .is_some_and(|res| res.is_ok())
+    }) {
+        return Ok(Some(path.clone()));
+    }
+
+    // 3rd priority: first GPU in alphabetical order
+    Ok(gpu_paths.first().cloned())
 }
 
 /// Returns the paths of all available GPU devices
@@ -269,10 +317,19 @@ pub fn primary_gpu<S: AsRef<str>>(seat: S) -> io::Result<Option<PathBuf>> {
 /// Might be used for manual  [`DrmDevice`](crate::backend::drm::DrmDevice)
 /// initialization.
 pub fn all_gpus<S: AsRef<str>>(seat: S) -> io::Result<Vec<PathBuf>> {
+    let mut gpus = gpus_for_seat(seat)?
+        .into_iter()
+        .flat_map(|device| device.devnode().map(PathBuf::from))
+        .collect::<Vec<_>>();
+    gpus.sort();
+    Ok(gpus)
+}
+
+fn gpus_for_seat<S: AsRef<str>>(seat: S) -> io::Result<Vec<Device>> {
     let mut enumerator = Enumerator::new()?;
     enumerator.match_subsystem("drm")?;
     enumerator.match_sysname("card[0-9]*")?;
-    let mut gpus = enumerator
+    let gpus = enumerator
         .scan_devices()?
         .filter(|device| {
             device
@@ -281,9 +338,7 @@ pub fn all_gpus<S: AsRef<str>>(seat: S) -> io::Result<Vec<PathBuf>> {
                 .unwrap_or_else(|| OsString::from("seat0"))
                 == *seat.as_ref()
         })
-        .flat_map(|device| device.devnode().map(PathBuf::from))
         .collect::<Vec<_>>();
-    gpus.sort();
     Ok(gpus)
 }
 

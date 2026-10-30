@@ -1,5 +1,3 @@
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use std::{
     cell::Cell,
     mem,
@@ -7,8 +5,8 @@ use std::{
     os::unix::io::{AsFd, BorrowedFd, OwnedFd},
     ptr,
     sync::{
-        mpsc::{channel, Sender},
         LazyLock, OnceLock, RwLock,
+        mpsc::{Sender, channel},
     },
     thread,
 };
@@ -300,7 +298,7 @@ unsafe fn place_sigbus_handler() {
             // We use `mem::zeroed()` because regular struct init as well as struct update syntax require all fields to be public
             // and libc does not guarantee that for all targets
             let mut action: libc::sigaction = mem::zeroed();
-            action.sa_sigaction = sigbus_handler as _;
+            action.sa_sigaction = sigbus_handler as *const () as _;
             action.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
 
             let mut old_action = mem::zeroed();

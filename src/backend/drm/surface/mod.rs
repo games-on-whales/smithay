@@ -1,10 +1,10 @@
 use std::io;
 use std::os::unix::io::{AsFd, BorrowedFd};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use drm::control::{connector, crtc, framebuffer, plane, Device as ControlDevice, Mode};
 use drm::Device as BasicDevice;
+use drm::control::{Device as ControlDevice, Mode, connector, crtc, framebuffer, plane};
 
 use libc::dev_t;
 
@@ -13,8 +13,8 @@ pub(super) mod atomic;
 pub(super) mod gbm;
 pub(super) mod legacy;
 use super::{
-    device::PlaneClaimStorage, error::Error, plane_type, DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType,
-    Planes,
+    DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes, device::PlaneClaimStorage, error::Error,
+    plane_type,
 };
 use crate::utils::DevPath;
 use crate::utils::{Buffer, Physical, Point, Rectangle, Transform};
@@ -69,9 +69,11 @@ impl PlaneDamageClips {
         device: &DrmDeviceFd,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
+        dst_transform: Transform,
+        damage_transform: Transform,
         damage: impl IntoIterator<Item = Rectangle<i32, Physical>>,
     ) -> io::Result<Option<Self>> {
-        let scale = src.size / dst.size.to_logical(1).to_buffer(1, Transform::Normal).to_f64();
+        let scale = src.size / dst.size.to_logical(1).to_buffer(1, dst_transform).to_f64();
 
         let mut rects = damage
             .into_iter()
@@ -81,8 +83,8 @@ impl PlaneDamageClips {
                     .to_logical(1f64)
                     .to_buffer(
                         1f64,
-                        Transform::Normal,
-                        &src.size.to_logical(1f64, Transform::Normal),
+                        damage_transform,
+                        &src.size.to_logical(scale, damage_transform),
                     )
                     .upscale(scale);
                 rect.loc += src.loc;
@@ -331,13 +333,21 @@ impl DrmSurface {
     /// Doing so might cause [`DrmSurface::commit_pending`] to return `true`.
     /// Check [`DrmSurface::vrr_supported`], which indicates if VRR can be
     /// used without a modeset on the attached connectors.
+    ///
+    /// Disabling VRR on legacy DRM is a no-op. Enabling VRR returns [`Error::UnknownProperty`].
     pub fn use_vrr(&self, vrr: bool) -> Result<(), Error> {
         match &*self.internal {
             DrmSurfaceInternal::Atomic(surf) => surf.use_vrr(vrr),
-            DrmSurfaceInternal::Legacy(_) => Err(Error::UnknownProperty {
-                handle: self.crtc.into(),
-                name: "VRR_ENABLED",
-            }),
+            DrmSurfaceInternal::Legacy(_) => {
+                if vrr {
+                    Err(Error::UnknownProperty {
+                        handle: self.crtc.into(),
+                        name: "VRR_ENABLED",
+                    })
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -352,7 +362,7 @@ impl DrmSurface {
         }
     }
 
-    /// Returns true whenever any state changes are pending to be commited
+    /// Returns true whenever any state changes are pending to be committed
     ///
     /// The following functions may trigger a pending commit:
     /// - [`add_connector`](DrmSurface::add_connector)

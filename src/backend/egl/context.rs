@@ -1,24 +1,24 @@
 //! EGL context related structs
 use std::{
     os::raw::c_int,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
 };
 
 use libc::c_void;
 
-use super::{ffi, wrap_egl_call_bool, wrap_egl_call_ptr, EGLError, Error, MakeCurrentError};
+use super::{EGLError, Error, MakeCurrentError, ffi, wrap_egl_call_bool, wrap_egl_call_ptr};
 use crate::{
     backend::{
         allocator::format::FormatSet,
         egl::{
-            display::{EGLDisplay, PixelFormat},
             EGLSurface,
+            display::{EGLDisplay, PixelFormat},
         },
     },
     utils::user_data::UserDataMap,
 };
 
-use tracing::{info, info_span, instrument, trace, warn};
+use tracing::{info, info_span, instrument, trace};
 
 /// EGL context for rendering
 #[derive(Debug)]
@@ -34,12 +34,24 @@ pub struct EGLContext {
 
 /// Defines the priority for an [`EGLContext`]
 ///
-/// see: <https://registry.khronos.org/EGL/extensions/IMG/EGL_IMG_context_priority.txt>
+/// The priority a context was actually created with can be
+/// queried with `EGLContext::get_context_priority`. This may
+/// higher or lower than what was requested depending on extension
+/// support and driver details.
+///
+/// See: <https://registry.khronos.org/EGL/extensions/IMG/EGL_IMG_context_priority.txt>
+/// See: <https://registry.khronos.org/EGL/extensions/NV/EGL_NV_context_priority_realtime.txt>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContextPriority {
+    /// RealTime priority
+    ///
+    /// Note: This might require special system privileges like `CAP_SYS_NICE`
+    /// or having DRM master to succeed.
+    RealTime,
     /// High priority
     ///
-    /// Note: This might require special system privileges like `CAP_SYS_NICE` to succeed.
+    /// Note: This might require special system privileges like `CAP_SYS_NICE`
+    /// or having DRM master to succeed.
     High,
     /// Medium priority
     ///
@@ -56,6 +68,7 @@ impl TryFrom<ffi::egl::types::EGLenum> for ContextPriority {
     #[inline]
     fn try_from(value: ffi::egl::types::EGLenum) -> Result<Self, Self::Error> {
         let priority = match value {
+            ffi::egl::CONTEXT_PRIORITY_REALTIME_NV => ContextPriority::RealTime,
             ffi::egl::CONTEXT_PRIORITY_HIGH_IMG => ContextPriority::High,
             ffi::egl::CONTEXT_PRIORITY_MEDIUM_IMG => ContextPriority::Medium,
             ffi::egl::CONTEXT_PRIORITY_LOW_IMG => ContextPriority::Low,
@@ -69,6 +82,7 @@ impl From<ContextPriority> for ffi::egl::types::EGLenum {
     #[inline]
     fn from(value: ContextPriority) -> Self {
         match value {
+            ContextPriority::RealTime => ffi::egl::CONTEXT_PRIORITY_REALTIME_NV,
             ContextPriority::High => ffi::egl::CONTEXT_PRIORITY_HIGH_IMG,
             ContextPriority::Medium => ffi::egl::CONTEXT_PRIORITY_MEDIUM_IMG,
             ContextPriority::Low => ffi::egl::CONTEXT_PRIORITY_LOW_IMG,
@@ -99,8 +113,8 @@ impl EGLContext {
         assert!(!config_id.is_null(), "EGL configuration id pointer is null");
         assert!(!context.is_null(), "EGLContext pointer is null");
 
-        let display = EGLDisplay::from_raw(display, config_id)?;
-        let pixel_format = display.get_pixel_format(config_id)?;
+        let display = unsafe { EGLDisplay::from_raw(display, config_id)? };
+        let pixel_format = unsafe { display.get_pixel_format(config_id)? };
 
         let span = info_span!(parent: &display.span, "egl_context", ptr = context as usize);
 
@@ -123,8 +137,7 @@ impl EGLContext {
     /// Creates a new configless `EGLContext` with the specified priority from a given `EGLDisplay`
     ///
     /// Note: The priority is a hint that might be ignored by the underlying platform.
-    /// It also requires `EGL_IMG_context_priority` to be available, otherwise the priority will be
-    /// ignored.
+    /// See [`ContextPriority`] for more information.
     pub fn new_with_priority(display: &EGLDisplay, priority: ContextPriority) -> Result<EGLContext, Error> {
         Self::new_internal(display, None, None, Some(priority))
     }
@@ -141,8 +154,7 @@ impl EGLContext {
     /// Create a new [`EGLContext`] from a given `EGLDisplay`, configuration requirements and priority
     ///
     /// Note: The priority is a hint that might be ignored by the underlying platform.
-    /// It also requires `EGL_IMG_context_priority` to be available, otherwise the priority will be
-    /// ignored.
+    /// See [`ContextPriority`] for more information.
     pub fn new_with_config_and_priority(
         display: &EGLDisplay,
         attributes: GlAttributes,
@@ -160,8 +172,7 @@ impl EGLContext {
     /// Create a new configless `EGLContext` with the specified priority from a given `EGLDisplay` sharing resources with another context
     ///
     /// Note: The priority is a hint that might be ignored by the underlying platform.
-    /// It also requires `EGL_IMG_context_priority` to be available, otherwise the priority will be
-    /// ignored.
+    /// See [`ContextPriority`] for more information.
     pub fn new_shared_with_priority(
         display: &EGLDisplay,
         share: &EGLContext,
@@ -183,8 +194,7 @@ impl EGLContext {
     /// Create a new `EGLContext` with the specified priority from a given `EGLDisplay` and configuration requirements sharing resources with another context
     ///
     /// Note: The priority is a hint that might be ignored by the underlying platform.
-    /// It also requires `EGL_IMG_context_priority` to be available, otherwise the priority will be
-    /// ignored.
+    /// See [`ContextPriority`] for more information.
     pub fn new_shared_with_config_and_priority(
         display: &EGLDisplay,
         share: &EGLContext,
@@ -199,7 +209,7 @@ impl EGLContext {
         display: &EGLDisplay,
         shared: Option<&EGLContext>,
         config: Option<(GlAttributes, PixelFormatRequirements)>,
-        priority: Option<ContextPriority>,
+        mut priority: Option<ContextPriority>,
     ) -> Result<EGLContext, Error> {
         let span = info_span!(parent: &display.span, "egl_context", ptr = tracing::field::Empty, shared = tracing::field::Empty);
         let _guard = span.enter();
@@ -271,19 +281,31 @@ impl EGLContext {
             context_attributes.push(2);
         }
 
-        let has_context_priority = display
-            .extensions()
-            .iter()
-            .any(|x| x == "EGL_IMG_context_priority");
-        if let Some(priority) = priority {
-            if !has_context_priority {
-                warn!(
-                    ?priority,
-                    "ignoring requested context priority, EGL_IMG_context_priority not supported"
-                );
-            } else {
+        let mut has_context_priority = false;
+        let mut has_realtime_context_priority = false;
+
+        for ext in display.extensions().iter() {
+            match ext.as_str() {
+                "EGL_IMG_context_priority" => has_context_priority = true,
+                "EGL_NV_context_priority_realtime" => has_realtime_context_priority = true,
+                _ => {}
+            }
+
+            if has_context_priority && has_realtime_context_priority {
+                break;
+            }
+        }
+
+        if let Some(ref mut priority) = priority {
+            if has_context_priority {
+                // We don't tell the client if realtime is supported or not, but we can fall back
+                // to high if it's set. They can query for the actual context priority obtained
+                // later, since the driver has whatever reason to not set to the requested priority.
+                if *priority == ContextPriority::RealTime && !has_realtime_context_priority {
+                    *priority = ContextPriority::High;
+                }
                 context_attributes.push(ffi::egl::CONTEXT_PRIORITY_LEVEL_IMG as i32);
-                context_attributes.push(Into::<ffi::egl::types::EGLenum>::into(priority) as i32);
+                context_attributes.push(Into::<ffi::egl::types::EGLenum>::into(*priority) as i32);
             }
         }
 
@@ -303,8 +325,8 @@ impl EGLContext {
         .map_err(Error::CreationFailed)?;
         span.record("ptr", context as usize);
 
-        let context_priority = if has_context_priority {
-            let mut context_priority = 0;
+        let obtained_context_priority = if has_context_priority {
+            let mut context_priority = ffi::egl::CONTEXT_PRIORITY_MEDIUM_IMG as ffi::egl::types::EGLint;
             let res = wrap_egl_call_bool(|| unsafe {
                 ffi::egl::QueryContext(
                     **display.get_display_handle(),
@@ -314,27 +336,15 @@ impl EGLContext {
                 )
             });
 
-            if res.is_ok() {
-                match ContextPriority::try_from(context_priority as ffi::egl::types::EGLenum) {
-                    Ok(context_priority) => Some(context_priority),
-                    Err(_) => {
-                        warn!(context_priority, "failed to parse context priority");
-                        None
-                    }
-                }
-            } else {
-                warn!("failed to query context priority");
-                None
+            match res {
+                Ok(_) => ContextPriority::try_from(context_priority as ffi::egl::types::EGLenum).ok(),
+                Err(_) => None,
             }
         } else {
             None
         };
 
-        if priority.is_some() && has_context_priority && priority != context_priority {
-            warn!(requested = ?priority, got = ?context_priority, "failed to set context priority");
-        }
-
-        info!(priority = ?context_priority, "EGL context created");
+        info!(priority = ?obtained_context_priority, "EGL context created");
 
         drop(_guard);
         Ok(EGLContext {
@@ -361,7 +371,7 @@ impl EGLContext {
     #[instrument(level = "trace", skip_all, parent = &self.span, err)]
     #[profiling::function]
     pub unsafe fn make_current(&self) -> Result<(), MakeCurrentError> {
-        wrap_egl_call_bool(|| {
+        wrap_egl_call_bool(|| unsafe {
             ffi::egl::MakeCurrent(
                 **self.display.get_display_handle(),
                 ffi::egl::NO_SURFACE,
@@ -382,7 +392,7 @@ impl EGLContext {
     /// being unbound again (see [`EGLContext::unbind`]).
     #[profiling::function]
     pub unsafe fn make_current_with_surface(&self, surface: &EGLSurface) -> Result<(), MakeCurrentError> {
-        self.make_current_with_draw_and_read_surface(surface, surface)
+        unsafe { self.make_current_with_draw_and_read_surface(surface, surface) }
     }
 
     /// Makes the OpenGL context the current context in the current thread with surfaces to
@@ -401,7 +411,7 @@ impl EGLContext {
     ) -> Result<(), MakeCurrentError> {
         let draw_surface_ptr = draw_surface.surface.load(Ordering::SeqCst);
         let read_surface_ptr = read_surface.surface.load(Ordering::SeqCst);
-        wrap_egl_call_bool(|| {
+        wrap_egl_call_bool(|| unsafe {
             ffi::egl::MakeCurrent(
                 **self.display.get_display_handle(),
                 draw_surface_ptr,
@@ -483,6 +493,35 @@ impl EGLContext {
     /// The pointer will become invalid, when this struct is destroyed.
     pub fn get_context_handle(&self) -> ffi::egl::types::EGLContext {
         self.context
+    }
+
+    /// Gets the [`ContextPriority`] this EGL context obtained.
+    ///
+    /// This may may be a higher or lower priority from what was actually
+    /// requested during creation; see the [`ContextPriority`] documentation
+    /// for more information.
+    ///
+    /// This will return None if the `EGL_IMG_context_priority` extension
+    /// is not supported.
+    pub fn get_context_priority(&self) -> Option<ContextPriority> {
+        let mut context_priority = ffi::egl::CONTEXT_PRIORITY_MEDIUM_IMG as ffi::egl::types::EGLint;
+        let has_context_priority = self
+            .display
+            .extensions()
+            .contains(&"EGL_IMG_context_priority".into());
+        has_context_priority.then_some(())?;
+
+        let _ = wrap_egl_call_bool(|| unsafe {
+            ffi::egl::QueryContext(
+                **self.display.get_display_handle(),
+                self.context,
+                ffi::egl::CONTEXT_PRIORITY_LEVEL_IMG as ffi::egl::types::EGLint,
+                &mut context_priority,
+            )
+        })
+        .ok()?;
+
+        ContextPriority::try_from(context_priority as ffi::egl::types::EGLenum).ok()
     }
 }
 

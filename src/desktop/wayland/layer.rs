@@ -1,9 +1,10 @@
 use crate::{
-    desktop::{utils::*, PopupManager},
+    backend::renderer::utils::RendererSurfaceStateUserData,
+    desktop::{PopupManager, utils::*},
     output::{Output, WeakOutput},
-    utils::{user_data::UserDataMap, IsAlive, Logical, Point, Rectangle, Size},
+    utils::{IsAlive, Logical, Point, Rectangle, Size, user_data::UserDataMap},
     wayland::{
-        compositor::{with_states, with_surface_tree_downward, SurfaceData, TraversalAction},
+        compositor::{SurfaceData, TraversalAction, with_states, with_surface_tree_downward},
         dmabuf::DmabufFeedback,
         seat::WaylandFocus,
         shell::wlr_layer::{
@@ -43,7 +44,7 @@ pub struct LayerMap {
 /// to the output and returned on subsequent calls.
 ///
 /// Note: This function internally uses a [`Mutex`] per
-/// [`Output`] as exposed by its return type. Therefor
+/// [`Output`] as exposed by its return type. Therefore
 /// trying to hold on to multiple references of a [`LayerMap`]
 /// of the same output using this function *will* result in a deadlock.
 pub fn layer_map_for_output(o: &Output) -> MutexGuard<'_, LayerMap> {
@@ -146,10 +147,10 @@ impl LayerMap {
         if !self.layers.contains(layer) {
             return None;
         }
-        let mut bbox = layer.bbox();
+        let mut geo = layer.geometry();
         let state = layer_state(layer);
-        bbox.loc += state.location.unwrap_or_default();
-        Some(bbox)
+        geo.loc += state.location.unwrap_or_default();
+        Some(geo)
     }
 
     /// Returns a [`LayerSurface`] under a given point and on a given layer, if any.
@@ -272,7 +273,15 @@ impl LayerMap {
             );
             trace!("Arranging layers into {:?}", output_rect.size);
 
-            for layer in self.layers.iter() {
+            let exclusive_surfaces = self
+                .layers
+                .iter()
+                .filter(|l| matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_)));
+            let non_exclusive_surfaces = self
+                .layers
+                .iter()
+                .filter(|l| !matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_)));
+            for layer in exclusive_surfaces.chain(non_exclusive_surfaces) {
                 let surface = layer.wl_surface();
 
                 with_surface_tree_downward(
@@ -297,9 +306,7 @@ impl LayerMap {
                     )
                 }
 
-                let data = with_states(surface, |states| {
-                    *states.cached_state.get::<LayerSurfaceCachedState>().current()
-                });
+                let data = layer.cached_state();
 
                 let mut source = match data.exclusive_zone {
                     ExclusiveZone::Exclusive(_) | ExclusiveZone::Neutral => zone,
@@ -360,50 +367,26 @@ impl LayerMap {
                 if let ExclusiveZone::Exclusive(amount) = data.exclusive_zone {
                     let amount = Saturating(amount as i32);
 
-                    match data.anchor {
-                        x if x.contains(Anchor::TOP) && x.contains(Anchor::BOTTOM) => {
-                            zone.size.w -= amount;
-                            if x.contains(Anchor::LEFT) {
-                                zone.loc.x += amount;
-                                zone.loc.x += data.margin.left;
-                                zone.size.w -= data.margin.left;
-                            }
-                            if x.contains(Anchor::RIGHT) {
-                                zone.size.w -= data.margin.right
-                            }
-                        }
-                        x if x.contains(Anchor::LEFT) && x.contains(Anchor::RIGHT) => {
-                            zone.size.h -= amount;
-                            if x.contains(Anchor::TOP) {
-                                zone.loc.y += amount;
-                                zone.loc.y += data.margin.top;
-                                zone.size.h -= data.margin.top
-                            }
-                            if x.contains(Anchor::BOTTOM) {
-                                zone.size.h -= data.margin.bottom
-                            }
-                        }
-                        x if x == Anchor::all() => {
-                            zone.size.w.0 = 0;
-                            zone.size.h.0 = 0;
-                        }
-                        x if x.contains(Anchor::LEFT) && !x.contains(Anchor::RIGHT) => {
-                            let sum = amount + Saturating(data.margin.left);
-                            zone.loc.x += sum;
-                            zone.size.w -= sum;
-                        }
-                        x if x.contains(Anchor::TOP) && !x.contains(Anchor::BOTTOM) => {
+                    match effective_exclusive_edge(&data) {
+                        Some(Anchor::TOP) => {
                             let sum = amount + Saturating(data.margin.top);
                             zone.loc.y += sum;
                             zone.size.h -= sum;
                         }
-                        x if x.contains(Anchor::RIGHT) && !x.contains(Anchor::LEFT) => {
-                            zone.size.w -= amount + Saturating(data.margin.right);
-                        }
-                        x if x.contains(Anchor::BOTTOM) && !x.contains(Anchor::TOP) => {
+                        Some(Anchor::BOTTOM) => {
                             zone.size.h -= amount + Saturating(data.margin.bottom);
                         }
-                        _ => {}
+                        Some(Anchor::LEFT) => {
+                            let sum = amount + Saturating(data.margin.left);
+                            zone.loc.x += sum;
+                            zone.size.w -= sum;
+                        }
+                        Some(Anchor::RIGHT) => {
+                            zone.size.w -= amount + Saturating(data.margin.right);
+                        }
+                        // Exclusive edge is always exactly one edge
+                        Some(_) => unreachable!(),
+                        None => {}
                     }
                 }
 
@@ -472,6 +455,26 @@ impl LayerMap {
     #[allow(clippy::len_without_is_empty)] //we don't need is_empty on that struct for now, mark as allow
     pub fn len(&self) -> usize {
         self.layers.len()
+    }
+}
+
+fn effective_exclusive_edge(data: &LayerSurfaceCachedState) -> Option<Anchor> {
+    data.exclusive_edge
+        .or_else(|| implied_exclusive_edge_for_anchor(data.anchor))
+}
+
+fn implied_exclusive_edge_for_anchor(anchor: Anchor) -> Option<Anchor> {
+    match anchor.bits().count_ones() {
+        0 | 2 | 4 => None,
+        1 => Some(anchor),
+        3 => Some(match anchor.complement() {
+            Anchor::TOP => Anchor::BOTTOM,
+            Anchor::BOTTOM => Anchor::TOP,
+            Anchor::LEFT => Anchor::RIGHT,
+            Anchor::RIGHT => Anchor::LEFT,
+            _ => unreachable!(),
+        }),
+        _ => unreachable!(),
     }
 }
 
@@ -551,42 +554,41 @@ impl LayerSurface {
         self.0.surface.wl_surface()
     }
 
-    /// Returns the cached protocol state
+    /// Returns a clone of the cached protocol state
     pub fn cached_state(&self) -> LayerSurfaceCachedState {
-        with_states(self.0.surface.wl_surface(), |states| {
-            *states.cached_state.get::<LayerSurfaceCachedState>().current()
-        })
+        self.0.surface.with_cached_state(Clone::clone)
     }
 
     /// Returns true, if the surface has indicated, that it is able to process keyboard events.
     pub fn can_receive_keyboard_focus(&self) -> bool {
-        with_states(self.0.surface.wl_surface(), |states| {
-            match states
-                .cached_state
-                .get::<LayerSurfaceCachedState>()
-                .current()
-                .keyboard_interactivity
-            {
+        self.0
+            .surface
+            .with_cached_state(|state| match state.keyboard_interactivity {
                 KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand => true,
                 KeyboardInteractivity::None => false,
-            }
-        })
+            })
     }
 
     /// Returns the layer this surface resides on, if any yet.
     pub fn layer(&self) -> WlrLayer {
-        with_states(self.0.surface.wl_surface(), |states| {
-            states
-                .cached_state
-                .get::<LayerSurfaceCachedState>()
-                .current()
-                .layer
-        })
+        self.0.surface.with_cached_state(|state| state.layer)
     }
 
     /// Returns the namespace of this surface
     pub fn namespace(&self) -> &str {
         &self.0.namespace
+    }
+
+    /// Returns the bounding box over this layer surface excluding its subsurfaces.
+    pub fn geometry(&self) -> Rectangle<i32, Logical> {
+        with_states(self.0.surface.wl_surface(), |states| {
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
+            data.and_then(|d| d.lock().unwrap().view()).map(|view| Rectangle {
+                loc: view.offset,
+                size: view.dst,
+            })
+        })
+        .unwrap_or_default()
     }
 
     /// Returns the bounding box over this layer surface and its subsurfaces.
@@ -733,11 +735,50 @@ impl LayerSurface {
     pub fn user_data(&self) -> &UserDataMap {
         &self.0.userdata
     }
+
+    /// Returns the exclusive zone set for the layer; except if an exclusive zone is set
+    /// but the exclusive edge is not set and cannot be inferred, then return `Neutral`.
+    fn effective_exclusive_zone(&self) -> ExclusiveZone {
+        with_states(self.wl_surface(), |states| {
+            let mut cached_state = states.cached_state.get::<LayerSurfaceCachedState>();
+            let data = cached_state.current();
+            if matches!(data.exclusive_zone, ExclusiveZone::Exclusive(_))
+                && effective_exclusive_edge(data).is_none()
+            {
+                ExclusiveZone::Neutral
+            } else {
+                data.exclusive_zone
+            }
+        })
+    }
 }
 
 impl WaylandFocus for LayerSurface {
     #[inline]
     fn wl_surface(&self) -> Option<Cow<'_, wl_surface::WlSurface>> {
         Some(Cow::Borrowed(self.0.surface.wl_surface()))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_implied_exclusive_edge() {
+        assert_eq!(implied_exclusive_edge_for_anchor(Anchor::empty()), None);
+        assert_eq!(implied_exclusive_edge_for_anchor(Anchor::all()), None);
+        assert_eq!(
+            implied_exclusive_edge_for_anchor(Anchor::BOTTOM | Anchor::LEFT),
+            None
+        );
+        assert_eq!(
+            implied_exclusive_edge_for_anchor(Anchor::BOTTOM),
+            Some(Anchor::BOTTOM)
+        );
+        assert_eq!(
+            implied_exclusive_edge_for_anchor(Anchor::LEFT | Anchor::TOP | Anchor::RIGHT),
+            Some(Anchor::TOP)
+        );
     }
 }

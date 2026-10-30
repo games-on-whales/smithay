@@ -2,30 +2,30 @@ use std::cell::RefCell;
 
 use tracing::debug;
 use wayland_server::{
+    Client, DataInit, DisplayHandle, Resource,
     protocol::{
         wl_data_device::{self, WlDataDevice},
         wl_seat::WlSeat,
     },
-    Client, DataInit, Dispatch, DisplayHandle, Resource,
 };
 
 use crate::{
-    input::{pointer::Focus, Seat, SeatHandler},
+    input::{Seat, SeatHandler, dnd::DndFocus},
     utils::Serial,
     wayland::{
-        compositor,
+        Dispatch2, compositor,
         seat::WaylandFocus,
         selection::{
+            SelectionTarget,
             device::SelectionDevice,
             offer::OfferReplySource,
             seat_data::SeatData,
             source::{SelectionSource, SelectionSourceProvider},
-            SelectionTarget,
         },
     },
 };
 
-use super::{dnd_grab, DataDeviceHandler, DataDeviceState};
+use super::{DataDeviceHandler, GrabType};
 
 /// WlSurface role of drag and drop icon
 pub const DND_ICON_ROLE: &str = "dnd_icon";
@@ -36,26 +36,25 @@ pub struct DataDeviceUserData {
     pub(crate) wl_seat: WlSeat,
 }
 
-impl<D> Dispatch<WlDataDevice, DataDeviceUserData, D> for DataDeviceState
+impl<D> Dispatch2<WlDataDevice, D> for DataDeviceUserData
 where
-    D: Dispatch<WlDataDevice, DataDeviceUserData>,
     D: DataDeviceHandler,
     D: SeatHandler,
-    <D as SeatHandler>::PointerFocus: WaylandFocus,
-    <D as SeatHandler>::TouchFocus: WaylandFocus,
+    <D as SeatHandler>::PointerFocus: DndFocus<D>,
+    <D as SeatHandler>::TouchFocus: DndFocus<D>,
     <D as SeatHandler>::KeyboardFocus: WaylandFocus,
     D: 'static,
 {
     fn request(
+        &self,
         handler: &mut D,
         client: &Client,
         resource: &WlDataDevice,
         request: wl_data_device::Request,
-        data: &DataDeviceUserData,
         dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
-        let seat = match Seat::<D>::from_resource(&data.wl_seat) {
+        let seat = match Seat::<D>::from_resource(&self.wl_seat) {
             Some(seat) => seat,
             None => return,
         };
@@ -74,7 +73,7 @@ where
                     handler
                         .data_device_state()
                         .used_sources
-                        .insert(source.clone(), data.wl_seat.clone());
+                        .insert(source.clone(), self.wl_seat.clone());
                 }
 
                 let serial = Serial::from(serial);
@@ -90,14 +89,24 @@ where
                             }
                         }
                         // The StartDrag is in response to a pointer implicit grab, all is good
-                        handler.started(source.clone(), icon.clone(), seat.clone());
-                        let start_data = pointer.grab_start_data().unwrap();
-                        pointer.set_grab(
-                            handler,
-                            dnd_grab::DnDGrab::new_pointer(dh, start_data, source, origin, seat, icon),
-                            serial,
-                            Focus::Clear,
-                        );
+                        if let Some(source) = source {
+                            handler.dnd_requested(
+                                source,
+                                icon.clone(),
+                                seat.clone(),
+                                serial,
+                                GrabType::Pointer,
+                            );
+                        } else {
+                            handler.dnd_requested(
+                                origin,
+                                icon.clone(),
+                                seat.clone(),
+                                serial,
+                                GrabType::Pointer,
+                            );
+                        }
+
                         return;
                     }
                 }
@@ -113,13 +122,23 @@ where
                             }
                         }
                         // The StartDrag is in response to a touch implicit grab, all is good
-                        handler.started(source.clone(), icon.clone(), seat.clone());
-                        let start_data = touch.grab_start_data().unwrap();
-                        touch.set_grab(
-                            handler,
-                            dnd_grab::DnDGrab::new_touch(dh, start_data, source, origin, seat, icon),
-                            serial,
-                        );
+                        if let Some(source) = source {
+                            handler.dnd_requested(
+                                source,
+                                icon.clone(),
+                                seat.clone(),
+                                serial,
+                                GrabType::Touch,
+                            );
+                        } else {
+                            handler.dnd_requested(
+                                origin,
+                                icon.clone(),
+                                seat.clone(),
+                                serial,
+                                GrabType::Touch,
+                            );
+                        }
                         return;
                     }
                 }
@@ -147,7 +166,7 @@ where
                     handler
                         .data_device_state()
                         .used_sources
-                        .insert(source.clone(), data.wl_seat.clone());
+                        .insert(source.clone(), self.wl_seat.clone());
                 }
 
                 let source = source.map(SelectionSourceProvider::DataDevice);
@@ -174,6 +193,17 @@ where
                 }),
 
             _ => unreachable!(),
+        }
+    }
+
+    fn destroyed(&self, _state: &mut D, _client: wayland_server::backend::ClientId, resource: &WlDataDevice) {
+        if let Some(seat) = Seat::<D>::from_resource(&self.wl_seat) {
+            if let Some(seat_data) = seat.user_data().get::<RefCell<SeatData<D::SelectionUserData>>>() {
+                seat_data.borrow_mut().retain_devices(|ndd| match ndd {
+                    SelectionDevice::DataDevice(ndd) => ndd != resource,
+                    _ => true,
+                });
+            }
         }
     }
 }

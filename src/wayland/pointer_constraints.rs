@@ -3,11 +3,11 @@
 //! This provides a way for the client to request that the pointer is confined to a region or
 //! locked in place.
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{HashMap, hash_map},
     ops,
     sync::{
+        Mutex, Weak,
         atomic::{AtomicBool, Ordering},
-        Mutex,
     },
 };
 
@@ -17,37 +17,61 @@ use wayland_protocols::wp::pointer_constraints::zv1::server::{
     zwp_pointer_constraints_v1::{self, Lifetime, ZwpPointerConstraintsV1},
 };
 use wayland_server::{
-    backend::GlobalId, protocol::wl_surface::WlSurface, Client, DataInit, Dispatch, DisplayHandle,
-    GlobalDispatch, New, Resource, WEnum,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::GlobalId,
+    protocol::wl_surface::WlSurface,
 };
 
 use super::compositor::{self, RegionAttributes};
 use crate::{
-    input::{pointer::PointerHandle, SeatHandler},
+    input::{
+        SeatHandler,
+        pointer::{PointerHandle, PointerRc},
+    },
     utils::{Logical, Point},
-    wayland::seat::PointerUserData,
+    wayland::{Dispatch2, GlobalData, GlobalDispatch2, seat::PointerUserData},
 };
 
 const VERSION: u32 = 1;
+
+/// Reason for Constraint remove
+#[derive(Debug)]
+pub enum ConstraintRemove {
+    /// Client call destroy
+    Destroyed(PointerConstraint),
+    /// Compositor pointer leave surface
+    PointerLeave(Option<RegionAttributes>),
+}
 
 /// Handler for pointer constraints
 pub trait PointerConstraintsHandler: SeatHandler {
     /// Pointer lock or confinement constraint created for `pointer` on `surface`
     ///
     /// Use [`with_pointer_constraint`] to access the constraint.
-    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>);
+    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 
-    /// The client holding a LockedPointer has commited a cursor position hint.
+    /// Pointer constraint removed for `pointer` on `surface`
+    ///
+    /// Use [`with_pointer_constraint`] to access the constraint.
+    fn remove_constraint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _constraint_remove: ConstraintRemove,
+    ) {
+    }
+
+    /// The client holding a LockedPointer has committed a cursor position hint.
     ///
     /// This is emitted upon a surface commit if the cursor position hint has been updated.
     ///
     /// Use [`with_pointer_constraint`] to access the constraint and check if it is active.
     fn cursor_position_hint(
         &mut self,
-        surface: &WlSurface,
-        pointer: &PointerHandle<Self>,
-        location: Point<f64, Logical>,
-    );
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+    }
 }
 
 /// Constraint confining pointer to a region of the surface
@@ -116,7 +140,7 @@ impl<D: SeatHandler + 'static> ops::Deref for PointerConstraintRef<'_, D> {
     }
 }
 
-impl<D: SeatHandler + 'static> PointerConstraintRef<'_, D> {
+impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<'_, D> {
     /// Send `locked`/`unlocked`
     ///
     /// This is not sent automatically since compositors may have different
@@ -124,12 +148,14 @@ impl<D: SeatHandler + 'static> PointerConstraintRef<'_, D> {
     pub fn activate(&self) {
         match self.entry.get() {
             PointerConstraint::Confined(confined) => {
-                confined.handle.confined();
-                confined.active.store(true, Ordering::SeqCst);
+                if !confined.active.swap(true, Ordering::SeqCst) {
+                    confined.handle.confined();
+                }
             }
             PointerConstraint::Locked(locked) => {
-                locked.handle.locked();
-                locked.active.store(true, Ordering::SeqCst);
+                if !locked.active.swap(true, Ordering::SeqCst) {
+                    locked.handle.locked();
+                }
             }
         }
     }
@@ -141,18 +167,26 @@ impl<D: SeatHandler + 'static> PointerConstraintRef<'_, D> {
     /// This is sent automatically when the surface loses pointer focus, but
     /// may also be invoked while the surface is focused.
     pub fn deactivate(self) {
-        match self.entry.get() {
+        let deactivated = match self.entry.get() {
             PointerConstraint::Confined(confined) => {
-                confined.handle.unconfined();
-                confined.active.store(false, Ordering::SeqCst);
+                if confined.active.swap(false, Ordering::SeqCst) {
+                    confined.handle.unconfined();
+                    true
+                } else {
+                    false
+                }
             }
             PointerConstraint::Locked(locked) => {
-                locked.handle.unlocked();
-                locked.active.store(false, Ordering::SeqCst);
+                if locked.active.swap(false, Ordering::SeqCst) {
+                    locked.handle.unlocked();
+                    true
+                } else {
+                    false
+                }
             }
-        }
+        };
 
-        if self.lifetime() == WEnum::Value(Lifetime::Oneshot) {
+        if deactivated && self.lifetime() == WEnum::Value(Lifetime::Oneshot) {
             self.entry.remove_entry();
         }
     }
@@ -210,14 +244,14 @@ impl PointerConstraintsState {
     /// Create a new pointer constraints global
     pub fn new<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<ZwpPointerConstraintsV1, ()>,
-        D: Dispatch<ZwpPointerConstraintsV1, ()>,
+        D: GlobalDispatch<ZwpPointerConstraintsV1, GlobalData>,
+        D: Dispatch<ZwpPointerConstraintsV1, GlobalData>,
         D: Dispatch<ZwpConfinedPointerV1, PointerConstraintUserData<D>>,
         D: Dispatch<ZwpLockedPointerV1, PointerConstraintUserData<D>>,
         D: SeatHandler,
         D: 'static,
     {
-        let global = display.create_global::<D, ZwpPointerConstraintsV1, _>(VERSION, ());
+        let global = display.create_global::<D, ZwpPointerConstraintsV1, _>(VERSION, GlobalData);
 
         Self { global }
     }
@@ -232,7 +266,7 @@ impl PointerConstraintsState {
 #[derive(Debug)]
 pub struct PointerConstraintUserData<D: SeatHandler> {
     surface: WlSurface,
-    pointer: Option<PointerHandle<D>>,
+    arc: Weak<PointerRc<D>>,
 }
 
 struct PointerConstraintData<D: SeatHandler + 'static> {
@@ -322,7 +356,7 @@ fn add_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
         if data.constraints.contains_key(pointer) {
             pointer_constraints.post_error(
                 zwp_pointer_constraints_v1::Error::AlreadyConstrained,
-                "pointer constrait already exists for surface and seat",
+                "pointer constraint already exists for surface and seat",
             );
         } else {
             data.constraints.insert(pointer.clone(), constraint);
@@ -334,17 +368,27 @@ fn add_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
     }
 }
 
-fn remove_constraint<D: SeatHandler + 'static>(surface: &WlSurface, pointer: &PointerHandle<D>) {
-    with_constraint_data::<D, _, _>(surface, |data| {
+fn remove_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
+    state: &mut D,
+    surface: &WlSurface,
+    pointer: &PointerHandle<D>,
+) {
+    let is_removed = with_constraint_data::<D, _, _>(surface, |data| {
         if let Some(data) = data {
-            data.constraints.remove(pointer);
+            if let Some(constraint) = data.constraints.remove(pointer) {
+                return Some(constraint);
+            }
         }
+        None
     });
+
+    if let Some(constraint) = is_removed {
+        state.remove_constraint(surface, pointer, ConstraintRemove::Destroyed(constraint));
+    }
 }
 
-impl<D> Dispatch<ZwpPointerConstraintsV1, (), D> for PointerConstraintsState
+impl<D> Dispatch2<ZwpPointerConstraintsV1, D> for GlobalData
 where
-    D: Dispatch<ZwpPointerConstraintsV1, ()>,
     D: Dispatch<ZwpConfinedPointerV1, PointerConstraintUserData<D>>,
     D: Dispatch<ZwpLockedPointerV1, PointerConstraintUserData<D>>,
     D: SeatHandler,
@@ -352,11 +396,11 @@ where
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &wayland_server::Client,
         pointer_constraints: &ZwpPointerConstraintsV1,
         request: zwp_pointer_constraints_v1::Request,
-        _data: &(),
         _dh: &DisplayHandle,
         data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -369,15 +413,16 @@ where
                 lifetime,
             } => {
                 let region = region.as_ref().map(compositor::get_region_attributes);
-                let pointer = pointer.data::<PointerUserData<D>>().unwrap().handle.clone();
+                let arc = pointer.data::<PointerUserData<D>>().unwrap().arc.clone();
                 let handle = data_init.init(
                     id,
                     PointerConstraintUserData {
                         surface: surface.clone(),
-                        pointer: pointer.clone(),
+                        arc: arc.clone(),
                     },
                 );
-                if let Some(pointer) = pointer {
+                if let Some(arc) = arc.upgrade() {
+                    let pointer = PointerHandle { arc };
                     add_constraint(
                         pointer_constraints,
                         &surface,
@@ -403,15 +448,16 @@ where
                 lifetime,
             } => {
                 let region = region.as_ref().map(compositor::get_region_attributes);
-                let pointer = pointer.data::<PointerUserData<D>>().unwrap().handle.clone();
+                let arc = pointer.data::<PointerUserData<D>>().unwrap().arc.clone();
                 let handle = data_init.init(
                     id,
                     PointerConstraintUserData {
                         surface: surface.clone(),
-                        pointer: pointer.clone(),
+                        arc: arc.clone(),
                     },
                 );
-                if let Some(pointer) = pointer {
+                if let Some(arc) = arc.upgrade() {
+                    let pointer = PointerHandle { arc };
                     add_constraint(
                         pointer_constraints,
                         &surface,
@@ -433,47 +479,44 @@ where
     }
 }
 
-impl<D> GlobalDispatch<ZwpPointerConstraintsV1, (), D> for PointerConstraintsState
+impl<D> GlobalDispatch2<ZwpPointerConstraintsV1, D> for GlobalData
 where
-    D: GlobalDispatch<ZwpPointerConstraintsV1, ()>
-        + Dispatch<ZwpPointerConstraintsV1, ()>
-        + SeatHandler
-        + 'static,
+    D: Dispatch<ZwpPointerConstraintsV1, GlobalData> + SeatHandler + 'static,
 {
     fn bind(
+        &self,
         _state: &mut D,
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<ZwpPointerConstraintsV1>,
-        _global_data: &(),
         data_init: &mut DataInit<'_, D>,
     ) {
-        data_init.init(resource, ());
+        data_init.init(resource, GlobalData);
     }
 }
 
-impl<D> Dispatch<ZwpConfinedPointerV1, PointerConstraintUserData<D>, D> for PointerConstraintsState
+impl<D> Dispatch2<ZwpConfinedPointerV1, D> for PointerConstraintUserData<D>
 where
-    D: Dispatch<ZwpConfinedPointerV1, PointerConstraintUserData<D>>,
     D: SeatHandler,
+    D: PointerConstraintsHandler,
     D: 'static,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _confined_pointer: &ZwpConfinedPointerV1,
         request: zwp_confined_pointer_v1::Request,
-        data: &PointerConstraintUserData<D>,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
-        let Some(pointer) = &data.pointer else {
+        let Some(pointer) = &self.arc.upgrade().map(|arc| PointerHandle { arc }) else {
             return;
         };
 
         match request {
             zwp_confined_pointer_v1::Request::SetRegion { region } => {
-                with_pointer_constraint(&data.surface, pointer, |constraint| {
+                with_pointer_constraint(&self.surface, pointer, |constraint| {
                     if let Some(PointerConstraint::Confined(confined)) =
                         constraint.map(|x| x.entry.into_mut())
                     {
@@ -487,48 +530,48 @@ where
     }
 
     fn destroyed(
-        _state: &mut D,
+        &self,
+        state: &mut D,
         _client: wayland_server::backend::ClientId,
         _resource: &ZwpConfinedPointerV1,
-        data: &PointerConstraintUserData<D>,
     ) {
-        let Some(pointer) = &data.pointer else {
+        let Some(pointer) = &self.arc.upgrade().map(|arc| PointerHandle { arc }) else {
             return;
         };
 
-        remove_constraint(&data.surface, pointer);
+        remove_constraint(state, &self.surface, pointer);
     }
 }
 
-impl<D> Dispatch<ZwpLockedPointerV1, PointerConstraintUserData<D>, D> for PointerConstraintsState
+impl<D> Dispatch2<ZwpLockedPointerV1, D> for PointerConstraintUserData<D>
 where
-    D: Dispatch<ZwpLockedPointerV1, PointerConstraintUserData<D>>,
     D: SeatHandler,
+    D: PointerConstraintsHandler,
     D: 'static,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _locked_pointer: &ZwpLockedPointerV1,
         request: zwp_locked_pointer_v1::Request,
-        data: &PointerConstraintUserData<D>,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
-        let Some(pointer) = &data.pointer else {
+        let Some(pointer) = &self.arc.upgrade().map(|arc| PointerHandle { arc }) else {
             return;
         };
 
         match request {
             zwp_locked_pointer_v1::Request::SetCursorPositionHint { surface_x, surface_y } => {
-                with_pointer_constraint(&data.surface, pointer, |constraint| {
+                with_pointer_constraint(&self.surface, pointer, |constraint| {
                     if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
                         locked.pending_cursor_position_hint = Some((surface_x, surface_y).into());
                     }
                 });
             }
             zwp_locked_pointer_v1::Request::SetRegion { region } => {
-                with_pointer_constraint(&data.surface, pointer, |constraint| {
+                with_pointer_constraint(&self.surface, pointer, |constraint| {
                     if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
                         locked.pending_region = region.as_ref().map(compositor::get_region_attributes);
                     }
@@ -540,34 +583,15 @@ where
     }
 
     fn destroyed(
-        _state: &mut D,
+        &self,
+        state: &mut D,
         _client: wayland_server::backend::ClientId,
         _resource: &ZwpLockedPointerV1,
-        data: &PointerConstraintUserData<D>,
     ) {
-        let Some(pointer) = &data.pointer else {
+        let Some(pointer) = &self.arc.upgrade().map(|arc| PointerHandle { arc }) else {
             return;
         };
 
-        remove_constraint(&data.surface, pointer);
+        remove_constraint(state, &self.surface, pointer);
     }
-}
-
-#[allow(missing_docs)]
-#[macro_export]
-macro_rules! delegate_pointer_constraints {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1: ()
-        ] => $crate::wayland::pointer_constraints::PointerConstraintsState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1: ()
-        ] => $crate::wayland::pointer_constraints::PointerConstraintsState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_confined_pointer_v1::ZwpConfinedPointerV1: $crate::wayland::pointer_constraints::PointerConstraintUserData<Self>
-        ] => $crate::wayland::pointer_constraints::PointerConstraintsState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::pointer_constraints::zv1::server::zwp_locked_pointer_v1::ZwpLockedPointerV1: $crate::wayland::pointer_constraints::PointerConstraintUserData<Self>
-        ] => $crate::wayland::pointer_constraints::PointerConstraintsState);
-    };
 }

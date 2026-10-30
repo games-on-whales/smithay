@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-use ::drm::control::{connector, crtc};
+use smithay::reexports::drm::control::{connector, crtc};
 use smithay_drm_extras::{
     display_info,
     drm_scanner::{self, DrmScanEvent},
@@ -9,11 +9,11 @@ use smithay_drm_extras::{
 use smithay::{
     backend::{
         drm::{self, DrmDeviceFd, DrmNode},
-        session::{libseat::LibSeatSession, Session},
+        session::{Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent},
     },
     reexports::{
-        calloop::{timer::Timer, EventLoop, LoopHandle},
+        calloop::{EventLoop, LoopHandle, timer::Timer},
         rustix::fs::OFlags,
     },
     utils::DeviceFd,
@@ -131,6 +131,10 @@ impl State {
         self.device_changed(node);
     }
 
+    #[allow(
+        clippy::disallowed_macros,
+        reason = "connector hotplug reports are this demo's output"
+    )]
     fn connector_connected(&mut self, node: DrmNode, connector: connector::Info, crtc: crtc::Handle) {
         if let Some(device) = self.devices.get_mut(&node) {
             let name = format!("{}-{}", connector.interface().as_str(), connector.interface_id());
@@ -156,6 +160,10 @@ impl State {
         }
     }
 
+    #[allow(
+        clippy::disallowed_macros,
+        reason = "connector hotplug reports are this demo's output"
+    )]
     fn connector_disconnected(&mut self, node: DrmNode, connector: connector::Info, crtc: crtc::Handle) {
         let name = format!("{}-{}", connector.interface().as_str(), connector.interface_id());
 
@@ -192,6 +200,7 @@ impl State {
                 } => {
                     self.connector_disconnected(node, connector, crtc);
                 }
+                DrmScanEvent::Changed { .. } => {}
                 _ => {}
             }
         }

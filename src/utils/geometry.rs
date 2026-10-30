@@ -33,39 +33,40 @@ pub trait Coordinate:
     /// A Coordinate that is 0
     const ZERO: Self;
     /// Downscale the coordinate
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn downscale(self, scale: Self) -> Self;
     /// Upscale the coordinate
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn upscale(self, scale: Self) -> Self;
     /// Convert the coordinate to a f64
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn to_f64(self) -> f64;
     /// Convert to this coordinate from a f64
     fn from_f64(v: f64) -> Self;
     /// Compare and return the smaller one
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn min(self, other: Self) -> Self {
-        if self < other {
-            self
-        } else {
-            other
-        }
+        if self < other { self } else { other }
     }
     /// Compare and return the larger one
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn max(self, other: Self) -> Self {
-        if self > other {
-            self
-        } else {
-            other
-        }
+        if self > other { self } else { other }
     }
     /// Test if the coordinate is not negative
     fn non_negative(self) -> bool;
     /// Returns the absolute value of this coordinate
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn abs(self) -> Self;
 
     /// Saturating integer addition. Computes self + other, saturating at the numeric bounds instead of overflowing.
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn saturating_add(self, other: Self) -> Self;
     /// Saturating integer subtraction. Computes self - other, saturating at the numeric bounds instead of overflowing.
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn saturating_sub(self, other: Self) -> Self;
     /// Saturating integer multiplication. Computes self * other, saturating at the numeric bounds instead of overflowing.
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     fn saturating_mul(self, other: Self) -> Self;
 }
 
@@ -405,6 +406,7 @@ impl<N: Coordinate, Kind> Point<N, Kind> {
     ///
     /// Checks that the coordinates are positive with a `debug_assert!()`.
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_size(self) -> Size<N, Kind> {
         debug_assert!(
             self.x.non_negative() && self.y.non_negative(),
@@ -422,6 +424,7 @@ impl<N: Coordinate, Kind> Point<N, Kind> {
     ///
     /// Ensures that the coordinates are positive by taking their absolute value
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_size_abs(self) -> Size<N, Kind> {
         Size {
             w: self.x.abs(),
@@ -432,6 +435,7 @@ impl<N: Coordinate, Kind> Point<N, Kind> {
 
     /// Upscale this [`Point`] by a specified [`Scale`]
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn upscale(self, scale: impl Into<Scale<N>>) -> Point<N, Kind> {
         let scale = scale.into();
         Point {
@@ -443,6 +447,7 @@ impl<N: Coordinate, Kind> Point<N, Kind> {
 
     /// Downscale this [`Point`] by a specified [`Scale`]
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn downscale(self, scale: impl Into<Scale<N>>) -> Point<N, Kind> {
         let scale = scale.into();
         Point {
@@ -473,6 +478,7 @@ impl<N: Coordinate, Kind> Point<N, Kind> {
 impl<N: Coordinate, Kind> Point<N, Kind> {
     /// Convert the underlying numerical type to f64 for floating point manipulations
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_f64(self) -> Point<f64, Kind> {
         Point {
             x: self.x.to_f64(),
@@ -485,6 +491,7 @@ impl<N: Coordinate, Kind> Point<N, Kind> {
 impl<Kind> Point<f64, Kind> {
     /// Convert to i32 for integer-space manipulations by rounding float values
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_round<N: Coordinate>(self) -> Point<N, Kind> {
         Point {
             x: N::from_f64(self.x.round()),
@@ -495,6 +502,7 @@ impl<Kind> Point<f64, Kind> {
 
     /// Convert to i32 for integer-space manipulations by flooring float values
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_floor<N: Coordinate>(self) -> Point<N, Kind> {
         Point {
             x: N::from_f64(self.x.floor()),
@@ -505,6 +513,7 @@ impl<Kind> Point<f64, Kind> {
 
     /// Convert to i32 for integer-space manipulations by ceiling float values
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_ceil<N: Coordinate>(self) -> Point<N, Kind> {
         Point {
             x: N::from_f64(self.x.ceil()),
@@ -545,8 +554,9 @@ impl<N: Coordinate> Point<N, Logical> {
         self.to_f64().to_client(scale.into().to_f64()).to_i32_round()
     }
 
-    #[inline]
     /// Convert this logical point to physical coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical(self, scale: impl Into<Scale<N>>) -> Point<N, Physical> {
         let scale = scale.into();
         Point {
@@ -559,6 +569,7 @@ impl<N: Coordinate> Point<N, Logical> {
     /// Convert this logical point to physical coordinate space according to given scale factor
     /// and round the result
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_round<S: Coordinate, R: Coordinate>(
         self,
         scale: impl Into<Scale<S>>,
@@ -569,6 +580,7 @@ impl<N: Coordinate> Point<N, Logical> {
     /// Convert this logical point to physical coordinate space according to given scale factor
     /// and ceil the result
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_ceil<S: Coordinate, R: Coordinate>(
         &self,
         scale: impl Into<Scale<S>>,
@@ -579,6 +591,7 @@ impl<N: Coordinate> Point<N, Logical> {
     /// Convert this logical point to physical coordinate space according to given scale factor
     /// and floor the result
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_floor<S: Coordinate, R: Coordinate>(
         &self,
         scale: impl Into<Scale<S>>,
@@ -586,8 +599,9 @@ impl<N: Coordinate> Point<N, Logical> {
         self.to_f64().to_physical(scale.into().to_f64()).to_i32_floor()
     }
 
-    #[inline]
     /// Convert this logical point to buffer coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_buffer(
         self,
         scale: impl Into<Scale<N>>,
@@ -607,6 +621,7 @@ impl<N: Coordinate> Point<N, Logical> {
 #[cfg(feature = "wayland_frontend")]
 impl<N: Coordinate> Point<N, Client> {
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub(crate) fn to_logical(self, scale: impl Into<Scale<N>>) -> Point<N, Logical> {
         let scale = scale.into();
         Point {
@@ -618,8 +633,9 @@ impl<N: Coordinate> Point<N, Client> {
 }
 
 impl<N: Coordinate> Point<N, Physical> {
-    #[inline]
     /// Convert this physical point to logical coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_logical(self, scale: impl Into<Scale<N>>) -> Point<N, Logical> {
         let scale = scale.into();
         Point {
@@ -631,8 +647,9 @@ impl<N: Coordinate> Point<N, Physical> {
 }
 
 impl<N: Coordinate> Point<N, Buffer> {
-    #[inline]
     /// Convert this physical point to logical coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_logical(
         self,
         scale: impl Into<Scale<N>>,
@@ -775,6 +792,7 @@ impl<N: Coordinate, Kind> Size<N, Kind> {
 impl<N: Coordinate, Kind> Size<N, Kind> {
     /// Convert this [`Size`] to a [`Point`] with the same coordinates
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_point(self) -> Point<N, Kind> {
         Point {
             x: self.w,
@@ -786,6 +804,7 @@ impl<N: Coordinate, Kind> Size<N, Kind> {
 
 impl<N: Coordinate, Kind> Size<N, Kind> {
     /// Restrict this [`Size`] to min and max [`Size`] with the same coordinates
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn clamp(self, min: impl Into<Size<N, Kind>>, max: impl Into<Size<N, Kind>>) -> Size<N, Kind> {
         let min = min.into();
         let max = max.into();
@@ -801,6 +820,7 @@ impl<N: Coordinate, Kind> Size<N, Kind> {
 impl<N: Coordinate, Kind> Size<N, Kind> {
     /// Convert the underlying numerical type to f64 for floating point manipulations
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_f64(self) -> Size<f64, Kind> {
         Size {
             w: self.w.to_f64(),
@@ -813,6 +833,7 @@ impl<N: Coordinate, Kind> Size<N, Kind> {
 impl<N: Coordinate, Kind> Size<N, Kind> {
     /// Upscale this [`Size`] by a specified [`Scale`]
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn upscale(self, scale: impl Into<Scale<N>>) -> Size<N, Kind> {
         let scale = scale.into();
         Size {
@@ -824,6 +845,7 @@ impl<N: Coordinate, Kind> Size<N, Kind> {
 
     /// Downscale this [`Size`] by a specified [`Scale`]
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn downscale(self, scale: impl Into<Scale<N>>) -> Size<N, Kind> {
         let scale = scale.into();
         Size {
@@ -845,6 +867,7 @@ impl<N: Coordinate, Kind> Size<N, Kind> {
 impl<Kind> Size<f64, Kind> {
     /// Convert to i32 for integer-space manipulations by rounding float values
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_round<N: Coordinate>(self) -> Size<N, Kind> {
         Size {
             w: N::from_f64(self.w.round()),
@@ -855,6 +878,7 @@ impl<Kind> Size<f64, Kind> {
 
     /// Convert to i32 for integer-space manipulations by flooring float values
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_floor<N: Coordinate>(self) -> Size<N, Kind> {
         Size {
             w: N::from_f64(self.w.floor()),
@@ -865,6 +889,7 @@ impl<Kind> Size<f64, Kind> {
 
     /// Convert to i32 for integer-space manipulations by ceiling float values
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_ceil<N: Coordinate>(self) -> Size<N, Kind> {
         Size {
             w: N::from_f64(self.w.ceil()),
@@ -896,8 +921,9 @@ impl<N: Coordinate> Size<N, Logical> {
         }
     }
 
-    #[inline]
     /// Convert this logical size to physical coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical(self, scale: impl Into<Scale<N>>) -> Size<N, Physical> {
         let scale = scale.into();
         Size {
@@ -910,6 +936,7 @@ impl<N: Coordinate> Size<N, Logical> {
     /// Convert this logical size to physical coordinate space according to given scale factor
     /// and round the result
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_round<S: Coordinate, R: Coordinate>(
         self,
         scale: impl Into<Scale<S>>,
@@ -920,6 +947,7 @@ impl<N: Coordinate> Size<N, Logical> {
     /// Convert this logical size to physical coordinate space according to given scale factor
     /// and ceil the result
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_ceil<S: Coordinate, R: Coordinate>(
         &self,
         scale: impl Into<Scale<S>>,
@@ -930,6 +958,7 @@ impl<N: Coordinate> Size<N, Logical> {
     /// Convert this logical size to physical coordinate space according to given scale factor
     /// and floor the result
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_floor<S: Coordinate, R: Coordinate>(
         &self,
         scale: impl Into<Scale<S>>,
@@ -937,8 +966,9 @@ impl<N: Coordinate> Size<N, Logical> {
         self.to_f64().to_physical(scale.into().to_f64()).to_i32_floor()
     }
 
-    #[inline]
     /// Convert this logical size to buffer coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_buffer(self, scale: impl Into<Scale<N>>, transformation: Transform) -> Size<N, Buffer> {
         let scale = scale.into();
         transformation.transform_size(Size {
@@ -952,6 +982,7 @@ impl<N: Coordinate> Size<N, Logical> {
 #[cfg(feature = "wayland_frontend")]
 impl<N: Coordinate> Size<N, Client> {
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub(crate) fn to_logical(self, scale: impl Into<Scale<N>>) -> Size<N, Logical> {
         let scale = scale.into();
         Size {
@@ -963,8 +994,9 @@ impl<N: Coordinate> Size<N, Client> {
 }
 
 impl<N: Coordinate> Size<N, Physical> {
-    #[inline]
     /// Convert this physical point to logical coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_logical(self, scale: impl Into<Scale<N>>) -> Size<N, Logical> {
         let scale = scale.into();
         Size {
@@ -976,8 +1008,9 @@ impl<N: Coordinate> Size<N, Physical> {
 }
 
 impl<N: Coordinate> Size<N, Buffer> {
-    #[inline]
     /// Convert this physical point to logical coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_logical(self, scale: impl Into<Scale<N>>, transformation: Transform) -> Size<N, Logical> {
         let scale = scale.into();
         transformation.invert().transform_size(Size {
@@ -1150,6 +1183,7 @@ pub struct Rectangle<N, Kind> {
 
 impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     /// Convert the underlying numerical type to another
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_f64(self) -> Rectangle<f64, Kind> {
         Rectangle {
             loc: self.loc.to_f64(),
@@ -1160,6 +1194,7 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
 
 impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     /// Upscale this [`Rectangle`] by the supplied [`Scale`]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn upscale(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Kind> {
         let scale = scale.into();
         Rectangle {
@@ -1169,6 +1204,7 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     }
 
     /// Downscale this [`Rectangle`] by the supplied [`Scale`]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn downscale(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Kind> {
         let scale = scale.into();
         Rectangle {
@@ -1189,6 +1225,7 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
 impl<Kind> Rectangle<f64, Kind> {
     /// Convert to i32 for integer-space manipulations by rounding float values
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_round<N: Coordinate>(self) -> Rectangle<N, Kind> {
         Rectangle {
             loc: self.loc.to_i32_round(),
@@ -1198,12 +1235,14 @@ impl<Kind> Rectangle<f64, Kind> {
 
     /// Convert to i32 by returning the largest integer-space rectangle fitting into the float-based rectangle
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_down<N: Coordinate>(self) -> Rectangle<N, Kind> {
         Rectangle::from_extremities(self.loc.to_i32_ceil(), (self.loc + self.size).to_i32_floor())
     }
 
     /// Convert to i32 by returning the smallest integet-space rectangle encapsulating the float-based rectangle
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_i32_up<N: Coordinate>(self) -> Rectangle<N, Kind> {
         Rectangle::from_extremities(self.loc.to_i32_floor(), (self.loc + self.size).to_i32_ceil())
     }
@@ -1326,6 +1365,7 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     ///
     /// Returns `None` if the two rectangles don't overlap
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn intersection(self, other: impl Into<Rectangle<N, Kind>>) -> Option<Self> {
         let other = other.into();
         if !self.overlaps(other) {
@@ -1358,6 +1398,7 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
 
     /// Merge two [`Rectangle`] by producing the smallest rectangle that contains both
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn merge(self, other: Self) -> Self {
         Self::bounding_box([self.loc, self.loc + self.size, other.loc, other.loc + other.size])
     }
@@ -1368,11 +1409,13 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     /// be returned.
     /// If the other rectangle contains self no rectangle will be returned,
     /// otherwise up to 4 rectangles will be returned.
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn subtract_rect(self, other: Self) -> Vec<Self> {
         self.subtract_rects([other])
     }
 
     /// Subtract a set of [`Rectangle`]s from this [`Rectangle`]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn subtract_rects(self, others: impl IntoIterator<Item = Self>) -> Vec<Self> {
         let mut remaining = Vec::with_capacity(4);
         remaining.push(self);
@@ -1380,6 +1423,7 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     }
 
     /// Subtract a set of [`Rectangle`]s from a set [`Rectangle`]s
+    #[must_use = "to modify the results in-place, use `subtract_rects_many_in_place`"]
     pub fn subtract_rects_many(
         rects: impl IntoIterator<Item = Self>,
         others: impl IntoIterator<Item = Self>,
@@ -1394,27 +1438,24 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
         others: impl IntoIterator<Item = Self>,
     ) -> Vec<Self> {
         for other in others {
-            let items = rects.len();
-            let mut checked = 0usize;
-            let mut index = 0usize;
-
             // If there is nothing left we can stop,
             // we won't be able to subtract any further
-            if items == 0 {
+            if rects.is_empty() {
                 return rects;
             }
 
-            while checked != items {
-                checked += 1;
+            // Walk the original rects back to front
+            let mut index = rects.len();
+            while index > 0 {
+                index -= 1;
 
                 // If there is no overlap there is nothing to subtract
                 let Some(intersection) = rects[index].intersection(other) else {
-                    index += 1;
                     continue;
                 };
 
                 // We now know that we have to subtract the other rect
-                let item = rects.remove(index);
+                let item = rects.swap_remove(index);
 
                 // If we are completely contained then nothing is left
                 if other.contains_rect(item) {
@@ -1496,6 +1537,7 @@ impl<N: Coordinate> Rectangle<N, Logical> {
 
     /// Convert this logical rectangle to physical coordinate space according to given scale factor
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Physical> {
         let scale = scale.into();
         Rectangle {
@@ -1507,6 +1549,7 @@ impl<N: Coordinate> Rectangle<N, Logical> {
     /// Convert this logical rectangle to physical coordinate space according to given scale factor
     /// and round the result
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_round<S: Coordinate, R: Coordinate>(
         self,
         scale: impl Into<Scale<S>>,
@@ -1519,6 +1562,7 @@ impl<N: Coordinate> Rectangle<N, Logical> {
     ///
     /// This will ceil the location and floor the size after applying the scale
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_down<S: Coordinate, R: Coordinate>(
         &self,
         scale: impl Into<Scale<S>>,
@@ -1531,6 +1575,7 @@ impl<N: Coordinate> Rectangle<N, Logical> {
     ///
     /// This will floor the location and ceil the size after applying the scale
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_physical_precise_up<S: Coordinate, R: Coordinate>(
         &self,
         scale: impl Into<Scale<S>>,
@@ -1540,6 +1585,7 @@ impl<N: Coordinate> Rectangle<N, Logical> {
 
     /// Convert this logical rectangle to buffer coordinate space according to given scale factor
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_buffer(
         self,
         scale: impl Into<Scale<N>>,
@@ -1566,6 +1612,7 @@ impl<N: Coordinate> Rectangle<N, Logical> {
 #[cfg(feature = "wayland_frontend")]
 impl<N: Coordinate> Rectangle<N, Client> {
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub(crate) fn to_logical(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Logical> {
         let scale = scale.into();
         Rectangle {
@@ -1578,6 +1625,7 @@ impl<N: Coordinate> Rectangle<N, Client> {
 impl<N: Coordinate> Rectangle<N, Physical> {
     /// Convert this physical rectangle to logical coordinate space according to given scale factor
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_logical(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Logical> {
         let scale = scale.into();
         Rectangle {
@@ -1590,6 +1638,7 @@ impl<N: Coordinate> Rectangle<N, Physical> {
 impl<N: Coordinate> Rectangle<N, Buffer> {
     /// Convert this physical rectangle to logical coordinate space according to given scale factor
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn to_logical(
         self,
         scale: impl Into<Scale<N>>,
@@ -1656,6 +1705,161 @@ impl<N: Default, Kind> Default for Rectangle<N, Kind> {
     }
 }
 
+/// Extra pixels around a window/surface, such as for a decorations frame or drop shadow
+#[repr(C)]
+pub struct FrameExtents<N, Kind> {
+    /// Frame pixels on the left
+    pub left: N,
+    /// Frame pixels on the right
+    pub right: N,
+    /// Frame pixels on top
+    pub top: N,
+    /// Frame pixels on the bottom
+    pub bottom: N,
+    _kind: std::marker::PhantomData<Kind>,
+}
+
+impl<N, Kind> FrameExtents<N, Kind> {
+    /// Create a new FrameExtents
+    pub const fn new(left: N, right: N, top: N, bottom: N) -> Self {
+        Self {
+            left,
+            right,
+            top,
+            bottom,
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<N: Coordinate, Kind> FrameExtents<N, Kind> {
+    /// Convert the underlying numerical type to f64 for floating point manipulations
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
+    pub fn to_f64(self) -> FrameExtents<f64, Kind> {
+        FrameExtents {
+            left: self.left.to_f64(),
+            right: self.right.to_f64(),
+            top: self.top.to_f64(),
+            bottom: self.bottom.to_f64(),
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<N: Coordinate> FrameExtents<N, Physical> {
+    /// Convert this physical rectangle to logical coordinate space according to given scale factor
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
+    pub fn to_logical(&self, scale: impl Into<Scale<N>>) -> FrameExtents<N, Logical> {
+        let scale = scale.into();
+        FrameExtents {
+            left: self.left.downscale(scale.x),
+            right: self.right.downscale(scale.x),
+            top: self.top.downscale(scale.y),
+            bottom: self.bottom.downscale(scale.y),
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<Kind> FrameExtents<f64, Kind> {
+    /// Convert to i32 for integer-space manipulations by rounding float values
+    #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
+    pub fn to_i32_round<N: Coordinate>(self) -> FrameExtents<N, Kind> {
+        FrameExtents {
+            left: N::from_f64(self.left.round()),
+            right: N::from_f64(self.right.round()),
+            top: N::from_f64(self.top.round()),
+            bottom: N::from_f64(self.bottom.round()),
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<N: Default, Kind> Default for FrameExtents<N, Kind> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            left: N::default(),
+            right: N::default(),
+            top: N::default(),
+            bottom: N::default(),
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<N: fmt::Debug, S> fmt::Debug for FrameExtents<N, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("FrameExtents<{}>", std::any::type_name::<S>()))?;
+        f.debug_struct("")
+            .field("left", &self.left)
+            .field("right", &self.right)
+            .field("top", &self.top)
+            .field("bottom", &self.bottom)
+            .finish()
+    }
+}
+
+impl<N: Clone, Kind> Clone for FrameExtents<N, Kind> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            left: self.left.clone(),
+            right: self.right.clone(),
+            top: self.top.clone(),
+            bottom: self.bottom.clone(),
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<N: Copy, Kind> Copy for FrameExtents<N, Kind> {}
+
+impl<N: PartialEq, Kind> PartialEq for FrameExtents<N, Kind> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.left == other.left
+            && self.right == other.right
+            && self.top == other.top
+            && self.bottom == other.bottom
+    }
+}
+
+impl<N: Eq, Kind> Eq for FrameExtents<N, Kind> {}
+
+impl<N: Coordinate, Kind> Add<FrameExtents<N, Kind>> for Rectangle<N, Kind> {
+    type Output = Rectangle<N, Kind>;
+
+    fn add(self, rhs: FrameExtents<N, Kind>) -> Self::Output {
+        Rectangle::new(
+            (self.loc.x - rhs.left, self.loc.y - rhs.top).into(),
+            (
+                (self.size.w + rhs.left + rhs.right).max(N::ZERO),
+                (self.size.h + rhs.top + rhs.bottom).max(N::ZERO),
+            )
+                .into(),
+        )
+    }
+}
+
+impl<N: Coordinate, Kind> Sub<FrameExtents<N, Kind>> for Rectangle<N, Kind> {
+    type Output = Rectangle<N, Kind>;
+
+    fn sub(self, rhs: FrameExtents<N, Kind>) -> Self::Output {
+        Rectangle::new(
+            (self.loc.x + rhs.left, self.loc.y + rhs.top).into(),
+            (
+                (self.size.w - rhs.left - rhs.right).max(N::ZERO),
+                (self.size.h - rhs.top - rhs.bottom).max(N::ZERO),
+            )
+                .into(),
+        )
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 /// Possible transformations to two-dimensional planes
 #[derive(Default)]
@@ -1684,6 +1888,7 @@ impl Transform {
     ///
     /// Flipping is preserved and 180/Normal transformation are uneffected.
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn invert(&self) -> Transform {
         match self {
             Transform::Normal => Transform::Normal,
@@ -2021,6 +2226,19 @@ mod tests {
                 Rectangle::<i32, Logical>::from_size((20, 100).into()),
             ]
         )
+    }
+
+    #[test]
+    fn rectangle_subtract_rects_many_checks_all_rects() {
+        let a = Rectangle::<i32, Logical>::new((0, 0).into(), (20, 2).into());
+        let b = Rectangle::<i32, Logical>::new((2, 4).into(), (2, 2).into());
+        let c = Rectangle::<i32, Logical>::new((4, 8).into(), (20, 2).into());
+        let other = Rectangle::<i32, Logical>::from_size((10, 10).into());
+
+        let rects = Rectangle::subtract_rects_many_in_place(vec![a, b, c], [other]);
+        assert_eq!(rects.len(), 2);
+        assert!(rects.contains(&Rectangle::new((10, 0).into(), (10, 2).into())));
+        assert!(rects.contains(&Rectangle::new((10, 8).into(), (14, 2).into())));
     }
 
     #[test]

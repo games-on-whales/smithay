@@ -1,9 +1,9 @@
+use drm::control::Device as ControlDevice;
 use drm::control::atomic::AtomicModeReq;
 use drm::control::connector::Interface;
 use drm::control::property::ValueType;
-use drm::control::Device as ControlDevice;
 use drm::control::{
-    connector, crtc, dumbbuffer::DumbBuffer, framebuffer, plane, property, AtomicCommitFlags, Mode, PlaneType,
+    AtomicCommitFlags, Mode, PlaneType, connector, crtc, dumbbuffer::DumbBuffer, framebuffer, plane, property,
 };
 
 #[cfg(debug_assertions)]
@@ -13,8 +13,8 @@ use std::collections::HashSet;
 use std::fmt;
 use std::os::unix::io::AsRawFd;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex, RwLock,
+    atomic::{AtomicBool, Ordering},
 };
 
 use crate::backend::drm::error::AccessError;
@@ -23,10 +23,11 @@ use crate::{
     backend::{
         allocator::format::{get_bpp, get_depth},
         drm::{
-            device::atomic::{map_props, PropMapping},
+            DrmDeviceFd,
             device::DrmDeviceInternal,
+            device::atomic::{PropMapping, map_props},
             error::Error,
-            plane_type, DrmDeviceFd,
+            plane_type,
         },
     },
     utils::DevPath,
@@ -624,15 +625,9 @@ impl AtomicDrmSurface {
         if pending.vrr == value {
             return Ok(());
         }
+        let prop_mapping = self.prop_mapping.read().unwrap();
 
-        if value
-            && self
-                .prop_mapping
-                .read()
-                .unwrap()
-                .crtc_prop_handle(self.crtc, "VRR_ENABLED")
-                .is_err()
-        {
+        if value && prop_mapping.crtc_prop_handle(self.crtc, "VRR_ENABLED").is_err() {
             return Err(Error::UnknownProperty {
                 handle: self.crtc.into(),
                 name: "VRR_ENABLED",
@@ -655,20 +650,37 @@ impl AtomicDrmSurface {
             }),
         };
 
+        let req = AtomicRequest::build_request(
+            &prop_mapping,
+            self.crtc,
+            Some(pending.blob),
+            value,
+            &pending.connectors,
+            &[],
+            [&plane_config],
+        )?;
+
         if *current == *pending {
             // Try a non modesetting commit
             if self
-                .test_state_internal([plane_config.clone()], false, &current, &pending)
+                .fd
+                .atomic_commit(AtomicCommitFlags::TEST_ONLY, req.build()?)
                 .is_ok()
             {
-                current.vrr = value;
                 pending.vrr = value;
+                current.vrr = value;
                 return Ok(());
             }
         }
 
         // Try a modeset commit
-        self.test_state_internal([plane_config], true, &current, &pending)?;
+        self.fd
+            .atomic_commit(
+                AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+                req.build()?,
+            )
+            .map_err(|_| Error::TestFailed(self.crtc))?;
+
         pending.vrr = value;
         Ok(())
     }
@@ -996,6 +1008,20 @@ impl AtomicDrmSurface {
         } else {
             State::current_state(&*self.fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         };
+
+        // Re-initialize the mode blob which might got lost after suspend/resume
+        let mut pending = self.pending.write().unwrap();
+        let blob = self.fd.create_property_blob(&pending.mode).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Failed to create Property Blob for mode",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        })?;
+
+        let old_blob = std::mem::replace(&mut pending.blob, blob);
+        let _ = self.fd.destroy_property_blob(old_blob.into());
+
         Ok(())
     }
 
@@ -1074,37 +1100,6 @@ impl From<Transform> for DrmRotation {
             Transform::Flipped180 => DrmRotation::REFLECT_Y | DrmRotation::ROTATE_180,
             Transform::Flipped270 => DrmRotation::REFLECT_Y | DrmRotation::ROTATE_270,
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::{
-        backend::drm::surface::atomic::to_fixed,
-        utils::{Physical, Rectangle},
-    };
-
-    use super::AtomicDrmSurface;
-
-    fn is_send<S: Send>() {}
-
-    #[test]
-    fn surface_is_send() {
-        is_send::<AtomicDrmSurface>();
-    }
-
-    #[test]
-    fn test_fixed_point() {
-        let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.0, 1080.0).into());
-        let fixed = to_fixed(geometry.size.w) as u64;
-        assert_eq!(125829120, fixed);
-    }
-
-    #[test]
-    fn test_fractional_fixed_point() {
-        let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.1, 1080.0).into());
-        let fixed = to_fixed(geometry.size.w) as u64;
-        assert_eq!(125835674, fixed);
     }
 }
 
@@ -1647,5 +1642,36 @@ impl<'a> AtomicRequest<'a> {
         }
 
         Ok(req)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{
+        backend::drm::surface::atomic::to_fixed,
+        utils::{Physical, Rectangle},
+    };
+
+    use super::AtomicDrmSurface;
+
+    fn is_send<S: Send>() {}
+
+    #[test]
+    fn surface_is_send() {
+        is_send::<AtomicDrmSurface>();
+    }
+
+    #[test]
+    fn test_fixed_point() {
+        let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.0, 1080.0).into());
+        let fixed = to_fixed(geometry.size.w) as u64;
+        assert_eq!(125829120, fixed);
+    }
+
+    #[test]
+    fn test_fractional_fixed_point() {
+        let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.1, 1080.0).into());
+        let fixed = to_fixed(geometry.size.w) as u64;
+        assert_eq!(125835674, fixed);
     }
 }

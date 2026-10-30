@@ -142,7 +142,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
         for device in self
             .known_devices
             .iter()
-            .filter(|&device| restrict_to.is_none() || restrict_to == Some(device))
+            .filter(|&device| restrict_to.is_none_or(|r| r == device))
             .filter(|&device| match device {
                 // NOTE: filter by actual type here to not get a missmpatches when using selections
                 // later on.
@@ -179,7 +179,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                     device.unset_selection();
                     continue;
                 }
-                (Some(ref selection), _) => {
+                (Some(selection), _) => {
                     // DataControl devices is the client itself, however other devices use
                     // the currently focused one as a client.
                     let client_id = match device {

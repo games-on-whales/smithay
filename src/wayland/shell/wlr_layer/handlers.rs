@@ -4,14 +4,14 @@ use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::{self, 
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1;
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
 use wayland_server::protocol::wl_surface;
-use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, Resource, Weak};
+use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, Resource, Weak};
 
 use crate::utils::{
-    alive_tracker::{AliveTracker, IsAlive},
     Serial,
+    alive_tracker::{AliveTracker, IsAlive},
 };
 use crate::wayland::shell::xdg::XdgPopupSurfaceData;
-use crate::wayland::{compositor, shell::wlr_layer::Layer};
+use crate::wayland::{Dispatch2, GlobalData, GlobalDispatch2, compositor, shell::wlr_layer::Layer};
 
 use super::{
     Anchor, KeyboardInteractivity, LayerSurfaceAttributes, LayerSurfaceCachedState, LayerSurfaceData,
@@ -24,43 +24,41 @@ use super::LAYER_SURFACE_ROLE;
  * layer_shell
  */
 
-impl<D> GlobalDispatch<ZwlrLayerShellV1, WlrLayerShellGlobalData, D> for WlrLayerShellState
+impl<D> GlobalDispatch2<ZwlrLayerShellV1, D> for WlrLayerShellGlobalData
 where
-    D: GlobalDispatch<ZwlrLayerShellV1, WlrLayerShellGlobalData>,
-    D: Dispatch<ZwlrLayerShellV1, ()>,
+    D: Dispatch<ZwlrLayerShellV1, GlobalData>,
     D: Dispatch<ZwlrLayerSurfaceV1, WlrLayerSurfaceUserData>,
     D: WlrLayerShellHandler,
     D: 'static,
 {
     fn bind(
+        &self,
         _state: &mut D,
         _handle: &DisplayHandle,
         _client: &Client,
         resource: wayland_server::New<ZwlrLayerShellV1>,
-        _global_data: &WlrLayerShellGlobalData,
         data_init: &mut DataInit<'_, D>,
     ) {
-        data_init.init(resource, ());
+        data_init.init(resource, GlobalData);
     }
 
-    fn can_view(client: Client, global_data: &WlrLayerShellGlobalData) -> bool {
-        (global_data.filter)(&client)
+    fn can_view(&self, client: &Client) -> bool {
+        (self.filter)(client)
     }
 }
 
-impl<D> Dispatch<ZwlrLayerShellV1, (), D> for WlrLayerShellState
+impl<D> Dispatch2<ZwlrLayerShellV1, D> for GlobalData
 where
-    D: Dispatch<ZwlrLayerShellV1, ()>,
     D: Dispatch<ZwlrLayerSurfaceV1, WlrLayerSurfaceUserData>,
     D: WlrLayerShellHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &Client,
         shell: &ZwlrLayerShellV1,
         request: zwlr_layer_shell_v1::Request,
-        _data: &(),
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
@@ -122,49 +120,10 @@ where
                 });
 
                 if initial {
-                    compositor::add_pre_commit_hook::<D, _>(&wl_surface, |_state, _dh, surface| {
-                        compositor::with_states(surface, |states| {
-                            let guard = states
-                                .data_map
-                                .get::<Mutex<LayerSurfaceAttributes>>()
-                                .unwrap()
-                                .lock()
-                                .unwrap();
-
-                            let mut cached_guard = states.cached_state.get::<LayerSurfaceCachedState>();
-                            let pending = cached_guard.pending();
-
-                            if pending.size.w == 0 && !pending.anchor.anchored_horizontally() {
-                                guard.surface.post_error(
-                                    zwlr_layer_surface_v1::Error::InvalidSize,
-                                    "width 0 requested without setting left and right anchors",
-                                );
-                                return;
-                            }
-
-                            if pending.size.h == 0 && !pending.anchor.anchored_vertically() {
-                                guard.surface.post_error(
-                                    zwlr_layer_surface_v1::Error::InvalidSize,
-                                    "height 0 requested without setting top and bottom anchors",
-                                );
-                            }
-                        });
-                    });
-
-                    compositor::add_post_commit_hook::<D, _>(&wl_surface, |_state, _dh, surface| {
-                        compositor::with_states(surface, |states| {
-                            let mut guard = states
-                                .data_map
-                                .get::<Mutex<LayerSurfaceAttributes>>()
-                                .unwrap()
-                                .lock()
-                                .unwrap();
-
-                            if let Some(state) = guard.last_acked.clone() {
-                                guard.current = state;
-                            }
-                        });
-                    });
+                    compositor::add_pre_commit_hook::<D, _>(
+                        &wl_surface,
+                        super::LayerSurface::pre_commit_hook,
+                    );
                 }
 
                 let handle = super::LayerSurface {
@@ -212,17 +171,16 @@ impl IsAlive for ZwlrLayerSurfaceV1 {
     }
 }
 
-impl<D> Dispatch<ZwlrLayerSurfaceV1, WlrLayerSurfaceUserData, D> for WlrLayerShellState
+impl<D> Dispatch2<ZwlrLayerSurfaceV1, D> for WlrLayerSurfaceUserData
 where
-    D: Dispatch<ZwlrLayerSurfaceV1, WlrLayerSurfaceUserData>,
     D: WlrLayerShellHandler,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &Client,
         layer_surface: &ZwlrLayerSurfaceV1,
         request: zwlr_layer_surface_v1::Request,
-        data: &WlrLayerSurfaceUserData,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
@@ -290,8 +248,29 @@ where
                     }
                 };
             }
+            zwlr_layer_surface_v1::Request::SetExclusiveEdge { edge } => {
+                match Anchor::try_from(edge) {
+                    Ok(edge) => {
+                        let _ = with_surface_pending_state(layer_surface, |data| {
+                            if edge.is_empty() {
+                                data.exclusive_edge = None;
+                            } else if edge.bits().count_ones() == 1 {
+                                data.exclusive_edge = Some(edge);
+                            } else {
+                                layer_surface.post_error(
+                                    zwlr_layer_surface_v1::Error::InvalidExclusiveEdge,
+                                    "exclusive edge cannot have multiple edges",
+                                );
+                            }
+                        });
+                    }
+                    Err((err, msg)) => {
+                        layer_surface.post_error(err, msg);
+                    }
+                };
+            }
             zwlr_layer_surface_v1::Request::GetPopup { popup } => {
-                let Ok(parent_surface) = data.wl_surface.upgrade() else {
+                let Ok(parent_surface) = self.wl_surface.upgrade() else {
                     return;
                 };
 
@@ -316,7 +295,7 @@ where
                 );
             }
             zwlr_layer_surface_v1::Request::AckConfigure { serial } => {
-                let Ok(surface) = data.wl_surface.upgrade() else {
+                let Ok(surface) = self.wl_surface.upgrade() else {
                     return;
                 };
 
@@ -345,20 +324,23 @@ where
 
                 WlrLayerShellHandler::ack_configure(state, surface, configure);
             }
+            zwlr_layer_surface_v1::Request::Destroy => {
+                // Handled by destroyed handler
+            }
             _ => {}
         }
     }
 
     fn destroyed(
+        &self,
         state: &mut D,
         _client_id: wayland_server::backend::ClientId,
         layer_surface: &ZwlrLayerSurfaceV1,
-        data: &WlrLayerSurfaceUserData,
     ) {
-        data.alive_tracker.destroy_notify();
+        self.alive_tracker.destroy_notify();
 
         // remove this surface from the known ones (as well as any leftover dead surface)
-        let mut layers = data.shell_data.known_layers.lock().unwrap();
+        let mut layers = self.shell_data.known_layers.lock().unwrap();
         if let Some(index) = layers
             .iter()
             .position(|layer| layer.shell_surface.id() == layer_surface.id())

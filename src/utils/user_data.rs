@@ -252,7 +252,7 @@ mod list {
             if ptr.is_null() {
                 None
             } else {
-                Some(Box::from_raw(ptr))
+                Some(unsafe { Box::from_raw(ptr) })
             }
         }
 
@@ -280,7 +280,7 @@ mod list {
                     Ok(_) => return,
                     Err(head) => {
                         if !head.is_null() {
-                            return (*head).next.append_ptr(p);
+                            return unsafe { (*head).next.append_ptr(p) };
                         }
                     }
                 }
@@ -323,6 +323,12 @@ mod list {
     impl<T> Drop for AppendList<T> {
         fn drop(&mut self) {
             unsafe { Self::node_from_raw(mem::replace(self.0.get_mut(), ptr::null_mut())) };
+        }
+    }
+
+    impl<T> Default for AppendList<T> {
+        fn default() -> Self {
+            Self::new()
         }
     }
 

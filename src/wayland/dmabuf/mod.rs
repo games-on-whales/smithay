@@ -17,7 +17,6 @@
 //!
 //! ```no_run
 //! use smithay::{
-//!     delegate_dmabuf,
 //!     backend::allocator::dmabuf::{Dmabuf},
 //!     reexports::{
 //!         wayland_server::protocol::{
@@ -73,8 +72,7 @@
 //!     }
 //! }
 //!
-//! // Delegate dmabuf handling for State to DmabufState.
-//! delegate_dmabuf!(State);
+//! smithay::delegate_dispatch2!(State);
 //!
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
 //! # let display_handle = display.handle();
@@ -118,7 +116,7 @@
 //! [`DmabufFeedback`] uses preference tranches to inform the client about formats that could result on more optimal buffer placement.
 //! Preference tranches can be added to the feedback during initialization with [`DmabufFeedbackBuilder::add_preference_tranche`].
 //! Note that the order of formats within a tranche (`target_device` + `flags`) is undefined, if you want to communicate preference
-//! of a specific format you have to split the formats into multiple tranches. A tranche can additionally define [`TrancheFlags`](zwp_linux_dmabuf_feedback_v1::TrancheFlags)
+//! of a specific format you have to split the formats into multiple tranches. A tranche can additionally define [`TrancheFlags`]
 //! which can give clients additional context what the tranche represents. As an example formats gathered from drm planes
 //! should define [`TrancheFlags::Scanout`](`zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout) to communicate that buffers should be allocated so that
 //! they support scan-out by the device specified as the `target device`.
@@ -129,7 +127,7 @@
 //! #### Notes on clients binding version 3 or lower
 //!
 //! During instantiation the global will automatically build a format list from the provided [`DmabufFeedback`] consisting of all formats that are part of a tranche
-//! having the `target device` equal the `main device` and defining no special [`TrancheFlags`](zwp_linux_dmabuf_feedback_v1::TrancheFlags).
+//! having the `target device` equal the `main device` and defining no special [`TrancheFlags`].
 //!
 //! ### Without feedback (v3)
 //!
@@ -140,7 +138,6 @@
 //! ```no_run
 //! # extern crate wayland_server;
 //! # use smithay::{
-//! #     delegate_dmabuf,
 //! #     backend::allocator::dmabuf::Dmabuf,
 //! #     reexports::{wayland_server::protocol::wl_buffer::WlBuffer},
 //! #     wayland::{
@@ -161,7 +158,6 @@
 //! #     }
 //! #     fn dmabuf_imported(&mut self, global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {}
 //! # }
-//! # delegate_dmabuf!(State);
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
 //! # let display_handle = display.handle();
 //! # let mut dmabuf_state = DmabufState::new();
@@ -182,6 +178,8 @@
 //!     dmabuf_global,
 //! };
 //!
+//! smithay::delegate_dispatch2!(State);
+//!
 //! // Rest of the compositor goes here...
 //! ```
 
@@ -189,46 +187,52 @@ mod dispatch;
 
 use std::{
     collections::HashMap,
-    ops::Sub,
+    ops::{RangeInclusive, Sub},
     os::unix::io::AsFd,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use indexmap::{IndexMap, IndexSet};
-use rustix::fs::{seek, SeekFrom};
+use rustix::fs::{SeekFrom, seek};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
-    zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
+    zwp_linux_dmabuf_feedback_v1::{self, TrancheFlags},
+    zwp_linux_dmabuf_v1,
 };
 use wayland_server::{
+    Client, Dispatch, DisplayHandle, GlobalDispatch, Resource, WEnum,
     backend::{GlobalId, InvalidId},
     protocol::{
         wl_buffer::{self, WlBuffer},
         wl_surface::WlSurface,
     },
-    Client, Dispatch, DisplayHandle, GlobalDispatch, Resource, WEnum,
 };
 
 #[cfg(feature = "backend_drm")]
 use crate::backend::drm::DrmNode;
 use crate::{
     backend::allocator::{
-        dmabuf::{Dmabuf, DmabufFlags, Plane},
         Format, Fourcc, Modifier,
+        dmabuf::{Dmabuf, DmabufFlags, Plane},
     },
-    utils::{ids::id_gen, SealedFile, UnmanagedResource},
+    utils::{SealedFile, UnmanagedResource, ids::id_gen},
 };
 
 use super::{buffer::BufferHandler, compositor};
+
+fn dmabuf_flags_from_wire(raw: u32) -> DmabufFlags {
+    DmabufFlags::from_bits_retain(raw)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct DmabufFeedbackTranche {
     target_device: libc::dev_t,
     flags: zwp_linux_dmabuf_feedback_v1::TrancheFlags,
     indices: IndexSet<usize>,
+    version_range: RangeInclusive<u32>,
 }
 
 #[derive(Debug)]
@@ -316,9 +320,10 @@ impl DmabufFeedbackBuilder {
         let feedback_formats: IndexSet<Format> = formats.into_iter().collect();
         let format_indices: IndexSet<usize> = (0..feedback_formats.len()).collect();
         let main_tranche = DmabufFeedbackTranche {
-            flags: zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty(),
+            flags: zwp_linux_dmabuf_feedback_v1::TrancheFlags::Sampling,
             indices: format_indices,
             target_device: main_device,
+            version_range: 3u32..=6,
         };
 
         Self {
@@ -341,15 +346,15 @@ impl DmabufFeedbackBuilder {
     pub fn add_preference_tranche(
         mut self,
         target_device: libc::dev_t,
-        flags: Option<zwp_linux_dmabuf_feedback_v1::TrancheFlags>,
+        flags: zwp_linux_dmabuf_feedback_v1::TrancheFlags,
         formats: impl IntoIterator<Item = Format>,
+        version: impl Into<RangeInclusive<u32>>,
     ) -> Self {
-        let flags = flags.unwrap_or(zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty());
-
         let mut tranche = DmabufFeedbackTranche {
             target_device,
             flags,
             indices: Default::default(),
+            version_range: version.into(),
         };
 
         for format in formats {
@@ -447,15 +452,26 @@ impl PartialEq for DmabufFeedback {
 impl DmabufFeedback {
     /// Send this feedback to the provided [`ZwpLinuxDmabufFeedbackV1`](zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1)
     pub fn send(&self, feedback: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1) {
-        feedback.main_device(self.0.main_device.to_ne_bytes().to_vec());
+        if feedback.version() <= 5 {
+            feedback.main_device(self.0.main_device.to_ne_bytes().to_vec());
+        }
         feedback.format_table(
             self.0.format_table.file.as_fd(),
             self.0.format_table.file.size() as u32,
         );
 
-        for tranche in self.0.tranches.iter() {
+        for tranche in self
+            .0
+            .tranches
+            .iter()
+            .filter(|tranche| tranche.version_range.contains(&feedback.version()))
+        {
             feedback.tranche_target_device(tranche.target_device.to_ne_bytes().to_vec());
-            feedback.tranche_flags(tranche.flags);
+            let mut flags = tranche.flags;
+            if feedback.version() <= 5 {
+                flags.remove(TrancheFlags::Sampling);
+            }
+            feedback.tranche_flags(flags);
             feedback.tranche_formats(
                 tranche
                     .indices
@@ -473,7 +489,11 @@ impl DmabufFeedback {
         self.0
             .tranches
             .iter()
-            .filter(|tranche| tranche.target_device == self.0.main_device && tranche.flags.is_empty())
+            .filter(|tranche| {
+                tranche.target_device == self.0.main_device
+                    && tranche.flags == TrancheFlags::Sampling
+                    && tranche.version_range.contains(&3)
+            })
             .map(|tranche| tranche.indices.clone())
             .reduce(|mut acc, item| {
                 acc.extend(item);
@@ -493,9 +513,9 @@ struct SurfaceDmabufFeedbackStateInner {
 }
 
 /// Feedback state for a surface
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SurfaceDmabufFeedbackState {
-    inner: Arc<Mutex<Option<SurfaceDmabufFeedbackStateInner>>>,
+    inner: Arc<Mutex<SurfaceDmabufFeedbackStateInner>>,
 }
 
 impl SurfaceDmabufFeedbackState {
@@ -508,59 +528,35 @@ impl SurfaceDmabufFeedbackState {
 
     /// Set the feedback for this surface
     ///
-    /// Note: If the surface did not request feedback or the feedback equals
-    /// the current feedback this function does nothing
+    /// Note: If the feedback equals the current feedback this function does nothing
     pub fn set_feedback(&self, feedback: &DmabufFeedback) {
         let mut guard = self.inner.lock().unwrap();
-        if let Some(inner) = guard.as_mut() {
-            if &inner.feedback == feedback {
-                return;
-            }
-
-            for instance in inner.known_instances.iter().filter_map(|i| i.upgrade().ok()) {
-                feedback.send(&instance);
-            }
-
-            inner.feedback = feedback.clone();
+        if &guard.feedback == feedback {
+            return;
         }
+
+        for instance in guard.known_instances.iter().filter_map(|i| i.upgrade().ok()) {
+            feedback.send(&instance);
+        }
+
+        guard.feedback = feedback.clone();
     }
 
-    fn add_instance<F>(
+    fn add_instance(
         &self,
         instance: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
-        feedback_factory: F,
-    ) -> DmabufFeedback
-    where
-        F: FnOnce() -> DmabufFeedback,
-    {
+    ) -> DmabufFeedback {
         let mut guard = self.inner.lock().unwrap();
-        if let Some(inner) = guard.as_mut() {
-            inner.known_instances.push(instance.downgrade());
-            inner.feedback.clone()
-        } else {
-            let feedback = feedback_factory();
-            let inner = SurfaceDmabufFeedbackStateInner {
-                feedback: feedback.clone(),
-                known_instances: vec![instance.downgrade()],
-            };
-            *guard = Some(inner);
-            feedback
-        }
+        guard.known_instances.push(instance.downgrade());
+        guard.feedback.clone()
     }
 
     fn remove_instance(&self, instance: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1) {
-        let mut guard = self.inner.lock().unwrap();
-
-        // check if this was the last instance, in that case we can drop the feedback
-        let reset = if let Some(inner) = guard.as_mut() {
-            inner.known_instances.retain(|i| i != instance);
-            inner.known_instances.is_empty()
-        } else {
-            false
-        };
-        if reset {
-            *guard = None;
-        }
+        self.inner
+            .lock()
+            .unwrap()
+            .known_instances
+            .retain(|i| i != instance);
     }
 }
 
@@ -717,7 +713,7 @@ impl DmabufState {
             );
 
         let formats = Arc::new(formats);
-        let version = if default_feedback.is_some() { 5 } else { 3 };
+        let version = if default_feedback.is_some() { 6 } else { 3 };
 
         let known_default_feedbacks = Arc::new(Mutex::new(Vec::new()));
         let default_feedback = default_feedback.map(|f| Arc::new(Mutex::new(f.clone())));
@@ -836,6 +832,8 @@ pub struct DmabufParamsData {
     /// Pending planes for the params.
     modifier: Mutex<Option<Modifier>>,
     planes: Mutex<Vec<Plane>>,
+
+    node: Mutex<Option<libc::dev_t>>,
 }
 
 /// A handle to a registered dmabuf global.
@@ -998,14 +996,12 @@ pub trait DmabufHandler: BufferHandler {
     /// The `global` indicates which [`DmabufGlobal`] the buffer was imported to. You should import the dmabuf
     /// into your renderer to ensure the dmabuf may be used later when rendering.
     ///
-    /// Whether dmabuf import succeded is notified through the [`ImportNotifier`] object provided in this function.
+    /// Whether dmabuf import succeeded is notified through the [`ImportNotifier`] object provided in this function.
     fn dmabuf_imported(&mut self, global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier);
 
     /// This function allows to override the default [`DmabufFeedback`] for a surface
     ///
-    /// Note: This will only be called if there is no alive surface feedback for the surface.
-    /// Normally this will be the first time a surface requests feedback, but can also occur
-    /// if all instances have been destroyed and a new surface request is sent by the client.
+    /// Note: This will only be called if this will be the first time a surface requests feedback.
     ///
     /// Returning `None` will use the default [`DmabufFeedback`] from the global
     fn new_surface_feedback(
@@ -1028,39 +1024,6 @@ pub trait DmabufHandler: BufferHandler {
 /// [`WlBuffer`]: wl_buffer::WlBuffer
 pub fn get_dmabuf(buffer: &wl_buffer::WlBuffer) -> Result<&Dmabuf, UnmanagedResource> {
     buffer.data::<Dmabuf>().ok_or(UnmanagedResource)
-}
-
-/// Macro to delegate implementation of the linux dmabuf to [`DmabufState`].
-///
-/// You must also implement [`DmabufHandler`] to use this.
-#[macro_export]
-macro_rules! delegate_dmabuf {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        type __ZwpLinuxDmabufV1 =
-            $crate::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
-        type __ZwpLinuxBufferParamsV1 =
-            $crate::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1;
-        type __ZwpLinuxDmabufFeedbackv1 =
-            $crate::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
-
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __ZwpLinuxDmabufV1: $crate::wayland::dmabuf::DmabufGlobalData
-        ] => $crate::wayland::dmabuf::DmabufState);
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __ZwpLinuxDmabufV1: $crate::wayland::dmabuf::DmabufData
-        ] => $crate::wayland::dmabuf::DmabufState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __ZwpLinuxBufferParamsV1: $crate::wayland::dmabuf::DmabufParamsData
-        ] => $crate::wayland::dmabuf::DmabufState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_server::protocol::wl_buffer::WlBuffer: $crate::backend::allocator::dmabuf::Dmabuf
-        ] => $crate::wayland::dmabuf::DmabufState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            __ZwpLinuxDmabufFeedbackv1: $crate::wayland::dmabuf::DmabufFeedbackData
-        ] => $crate::wayland::dmabuf::DmabufState);
-
-    };
 }
 
 impl DmabufParamsData {
@@ -1203,13 +1166,20 @@ impl DmabufParamsData {
             (width, height),
             format,
             modifier,
-            DmabufFlags::from_bits_truncate(flags.into()),
+            dmabuf_flags_from_wire(flags.into()),
         );
 
+        planes.sort_by_key(|plane| plane.plane_idx);
         for (i, plane) in planes.drain(..).enumerate() {
-            let offset = plane.offset;
-            let stride = plane.stride;
-            buf.add_plane(plane.into(), i as u32, offset, stride);
+            if plane.plane_idx != i as u32 {
+                // After sorting, plane indices should be consecutive and start at 0.
+                params.post_error(
+                    zwp_linux_buffer_params_v1::Error::Incomplete,
+                    "missing or too many planes to create a buffer",
+                );
+                return None;
+            }
+            buf.add_plane(plane.fd, plane.offset, plane.stride);
         }
 
         #[cfg(feature = "backend_drm")]
@@ -1222,7 +1192,7 @@ impl DmabufParamsData {
 
             None => {
                 params.post_error(
-                    zwp_linux_buffer_params_v1::Error::Incomplete as u32,
+                    zwp_linux_buffer_params_v1::Error::Incomplete,
                     "Provided buffer is incomplete, it has zero planes",
                 );
                 return None;

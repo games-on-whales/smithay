@@ -4,11 +4,11 @@ use std::fmt;
 use std::io;
 
 use drm::buffer::Buffer as DrmBuffer;
-use drm::control::{dumbbuffer::DumbBuffer as Handle, Device as ControlDevice};
+use drm::control::{Device as ControlDevice, dumbbuffer::DumbBuffer as Handle};
 use tracing::instrument;
 
 use super::dmabuf::{AsDmabuf, Dmabuf, DmabufFlags};
-use super::{format::get_bpp, Allocator, Buffer, Format, Fourcc, Modifier};
+use super::{Allocator, Buffer, Format, Fourcc, Modifier, format::get_bpp};
 use crate::backend::drm::DrmDeviceFd;
 use crate::backend::drm::DrmNode;
 use crate::utils::{Buffer as BufferCoords, Size};
@@ -30,7 +30,7 @@ impl fmt::Debug for DumbBuffer {
 }
 
 /// Light wrapper around an [`DrmDeviceFd`] to implement the [`Allocator`]-trait
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DumbAllocator {
     fd: DrmDeviceFd,
 }
@@ -115,7 +115,7 @@ impl AsDmabuf for DumbBuffer {
             self.format.modifier,
             DmabufFlags::empty(),
         );
-        builder.add_plane(fd, 0, 0, self.handle.pitch());
+        builder.add_plane(fd, 0, self.handle.pitch());
         if let Ok(node) = DrmNode::from_file(&self.fd) {
             builder.set_node(node);
         }

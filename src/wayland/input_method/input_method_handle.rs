@@ -9,22 +9,22 @@ use wayland_protocols_misc::zwp_input_method_v2::server::{
     zwp_input_method_v2::{self, ZwpInputMethodV2},
     zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
 };
-use wayland_server::{backend::ClientId, protocol::wl_surface::WlSurface};
 use wayland_server::{
-    protocol::wl_keyboard::KeymapFormat, Client, DataInit, Dispatch, DisplayHandle, Resource,
+    Client, DataInit, Dispatch, DisplayHandle, Resource, protocol::wl_keyboard::KeymapFormat,
 };
+use wayland_server::{backend::ClientId, protocol::wl_surface::WlSurface};
 
 use crate::{
-    input::{keyboard::KeyboardHandle, SeatHandler},
-    utils::{alive_tracker::AliveTracker, Logical, Rectangle, SERIAL_COUNTER},
-    wayland::{compositor, seat::WaylandFocus, text_input::TextInputHandle},
+    input::{SeatHandler, keyboard::KeyboardHandle},
+    utils::{Logical, Rectangle, SERIAL_COUNTER, alive_tracker::AliveTracker},
+    wayland::{Dispatch2, compositor, seat::WaylandFocus, text_input::TextInputHandle},
 };
 
 use super::{
+    INPUT_POPUP_SURFACE_ROLE, InputMethodHandler, InputMethodKeyboardUserData,
+    InputMethodPopupSurfaceUserData,
     input_method_keyboard_grab::InputMethodKeyboardGrab,
     input_method_popup_surface::{PopupHandle, PopupParent, PopupSurface},
-    InputMethodHandler, InputMethodKeyboardUserData, InputMethodManagerState,
-    InputMethodPopupSurfaceUserData, INPUT_POPUP_SURFACE_ROLE,
 };
 
 #[derive(Default, Debug)]
@@ -57,9 +57,9 @@ pub struct InputMethodHandle {
 impl InputMethodHandle {
     pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(instance) = inner.instance.as_mut() {
-            instance.serial = 0;
-            instance.object.unavailable();
+        if inner.instance.is_some() {
+            // Only one input method per seat: a newcomer is made unavailable and inert.
+            instance.unavailable();
         } else {
             inner.instance = Some(Instance {
                 object: instance.clone(),
@@ -68,9 +68,19 @@ impl InputMethodHandle {
         }
     }
 
-    /// Whether there's an acitve instance of input-method.
-    pub(crate) fn has_instance(&self) -> bool {
+    /// Whether there's an active instance of input-method.
+    pub fn has_instance(&self) -> bool {
         self.inner.lock().unwrap().instance.is_some()
+    }
+
+    /// Whether `object` is the seat's active input method instance.
+    pub(super) fn is_active_instance(&self, object: &ZwpInputMethodV2) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .instance
+            .as_ref()
+            .is_some_and(|i| i.object.id() == object.id())
     }
 
     /// Callback function to access the input method object
@@ -98,6 +108,20 @@ impl InputMethodHandle {
         let inner = self.inner.lock().unwrap();
         let keyboard = inner.keyboard_grab.inner.lock().unwrap();
         keyboard.grab.is_some()
+    }
+
+    /// The client of the input method that has grabbed the keyboard, if any.
+    ///
+    /// This is necessary since input methods like fcitx typically grab the
+    /// keyboard, and forward unhandled keys through its own virtual keyboard.
+    /// These may result in an infinite loop if forwarded back through the grab.
+    /// The compositor should compare the client of virtual keyboards with this,
+    /// and forward keys from them with
+    /// [`KeyboardHandle::input_forward_bypassing_grab`].
+    pub fn keyboard_grab_client(&self) -> Option<Client> {
+        let inner = self.inner.lock().unwrap();
+        let keyboard = inner.keyboard_grab.inner.lock().unwrap();
+        keyboard.grab.as_ref()?.client()
     }
 
     pub(crate) fn set_text_input_rectangle<D: SeatHandler + 'static>(
@@ -185,9 +209,8 @@ impl<D: SeatHandler> fmt::Debug for InputMethodUserData<D> {
     }
 }
 
-impl<D> Dispatch<ZwpInputMethodV2, InputMethodUserData<D>, D> for InputMethodManagerState
+impl<D> Dispatch2<ZwpInputMethodV2, D> for InputMethodUserData<D>
 where
-    D: Dispatch<ZwpInputMethodV2, InputMethodUserData<D>>,
     D: Dispatch<ZwpInputPopupSurfaceV2, InputMethodPopupSurfaceUserData>,
     D: Dispatch<ZwpInputMethodKeyboardGrabV2, InputMethodKeyboardUserData<D>>,
     D: SeatHandler,
@@ -196,17 +219,42 @@ where
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &Client,
         seat: &ZwpInputMethodV2,
         request: zwp_input_method_v2::Request,
-        data: &InputMethodUserData<D>,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
+        // An inert newcomer drives nothing, but new-id requests must still init a child.
+        if !self.handle.is_active_instance(seat) {
+            match request {
+                zwp_input_method_v2::Request::GetInputPopupSurface { id, .. } => {
+                    data_init.init(
+                        id,
+                        InputMethodPopupSurfaceUserData {
+                            alive_tracker: AliveTracker::default(),
+                        },
+                    );
+                }
+                zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
+                    let keyboard_grab = self.handle.inner.lock().unwrap().keyboard_grab.clone();
+                    data_init.init(
+                        keyboard,
+                        InputMethodKeyboardUserData {
+                            handle: keyboard_grab,
+                            keyboard_handle: self.keyboard_handle.clone(),
+                        },
+                    );
+                }
+                _ => {}
+            }
+            return;
+        }
         match request {
             zwp_input_method_v2::Request::CommitString { text } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
+                self.text_input_handle.with_active_text_input(|ti, _surface| {
                     ti.commit_string(Some(text.clone()));
                 });
             }
@@ -215,7 +263,7 @@ where
                 cursor_begin,
                 cursor_end,
             } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
+                self.text_input_handle.with_active_text_input(|ti, _surface| {
                     ti.preedit_string(Some(text.clone()), cursor_begin, cursor_end);
                 });
             }
@@ -223,12 +271,12 @@ where
                 before_length,
                 after_length,
             } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
+                self.text_input_handle.with_active_text_input(|ti, _surface| {
                     ti.delete_surrounding_text(before_length, after_length);
                 });
             }
             zwp_input_method_v2::Request::Commit { serial } => {
-                let current_serial = data
+                let current_serial = self
                     .handle
                     .inner
                     .lock()
@@ -238,7 +286,7 @@ where
                     .map(|i| i.serial)
                     .unwrap_or(0);
 
-                data.text_input_handle.done(serial != current_serial);
+                self.text_input_handle.done(serial != current_serial);
             }
             zwp_input_method_v2::Request::GetInputPopupSurface { id, surface } => {
                 if compositor::give_role(&surface, INPUT_POPUP_SURFACE_ROLE).is_err()
@@ -249,7 +297,7 @@ where
                     return;
                 }
 
-                let parent = match data.text_input_handle.focus().clone() {
+                let parent = match self.text_input_handle.focus().clone() {
                     Some(parent) => {
                         let location = state.parent_geometry(&parent);
                         Some(PopupParent {
@@ -259,7 +307,7 @@ where
                     }
                     None => None,
                 };
-                let mut input_method = data.handle.inner.lock().unwrap();
+                let mut input_method = self.handle.inner.lock().unwrap();
 
                 let instance = data_init.init(
                     id,
@@ -275,8 +323,8 @@ where
                 }
             }
             zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
-                let input_method = data.handle.inner.lock().unwrap();
-                data.keyboard_handle.set_grab(
+                let input_method = self.handle.inner.lock().unwrap();
+                self.keyboard_handle.set_grab(
                     state,
                     input_method.keyboard_grab.clone(),
                     SERIAL_COUNTER.next_serial(),
@@ -285,15 +333,15 @@ where
                     keyboard,
                     InputMethodKeyboardUserData {
                         handle: input_method.keyboard_grab.clone(),
-                        keyboard_handle: data.keyboard_handle.clone(),
+                        keyboard_handle: self.keyboard_handle.clone(),
                     },
                 );
                 let mut keyboard = input_method.keyboard_grab.inner.lock().unwrap();
                 keyboard.grab = Some(instance.clone());
-                keyboard.text_input_handle = data.text_input_handle.clone();
-                let guard = data.keyboard_handle.arc.internal.lock().unwrap();
+                keyboard.text_input_handle = self.text_input_handle.clone();
+                let guard = self.keyboard_handle.arc.internal.lock().unwrap();
                 instance.repeat_info(guard.repeat_rate, guard.repeat_delay);
-                let keymap_file = data.keyboard_handle.arc.keymap.lock().unwrap();
+                let keymap_file = self.keyboard_handle.arc.keymap.lock().unwrap();
                 let res = keymap_file.with_fd(false, |fd, size| {
                     instance.keymap(KeymapFormat::XkbV1, fd, size as u32);
                 });
@@ -301,6 +349,8 @@ where
                 if let Err(err) = res {
                     warn!(err = ?err, "Failed to send keymap to client");
                 } else {
+                    keyboard.keymap_id = Some(keymap_file.id());
+
                     // Modifiers can be latched when taking the grab, thus we must send them to keep
                     // them in sync.
                     let mods = guard.mods_state.serialized;
@@ -320,13 +370,11 @@ where
         }
     }
 
-    fn destroyed(
-        _state: &mut D,
-        _client: ClientId,
-        _input_method: &ZwpInputMethodV2,
-        data: &InputMethodUserData<D>,
-    ) {
-        data.handle.inner.lock().unwrap().instance = None;
-        data.text_input_handle.leave();
+    fn destroyed(&self, _state: &mut D, _client: ClientId, input_method: &ZwpInputMethodV2) {
+        // Only the active instance leaving frees the seat.
+        if self.handle.is_active_instance(input_method) {
+            self.handle.inner.lock().unwrap().instance = None;
+            self.text_input_handle.leave();
+        }
     }
 }

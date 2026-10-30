@@ -1,33 +1,33 @@
-use std::{os::unix::io::OwnedFd, sync::Arc};
+use std::sync::Arc;
 
-use ::winit::platform::pump_events::PumpStatus;
+use ::winit::event_loop::pump_events::PumpStatus;
 use smithay::{
     backend::{
-        input::{InputEvent, KeyboardKeyEvent},
+        input::{InputEvent, InputTime, KeyboardKeyEvent},
         renderer::{
+            Color32F, Frame, Renderer,
             element::{
-                surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
                 Kind,
+                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
             gles::GlesRenderer,
             utils::{draw_render_elements, on_commit_buffer_handler},
-            Color32F, Frame, Renderer,
         },
         winit::{self, WinitEvent},
     },
-    delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
-    input::{keyboard::FilterResult, Seat, SeatHandler, SeatState},
-    reexports::wayland_server::{protocol::wl_seat, Display},
+    input::{Seat, SeatHandler, SeatState, keyboard::FilterResult},
+    reexports::wayland_server::{Display, protocol::wl_seat},
     utils::{Rectangle, Serial, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes, TraversalAction,
+            CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
+            with_surface_tree_downward,
         },
+        pointer_constraints::PointerConstraintsHandler,
         selection::{
-            data_device::{ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler},
             SelectionHandler,
+            data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
         },
         shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
         shm::{ShmHandler, ShmState},
@@ -35,12 +35,12 @@ use smithay::{
 };
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::{
+    Client, ListeningSocket,
     backend::{ClientData, ClientId, DisconnectReason},
     protocol::{
         wl_buffer,
         wl_surface::{self, WlSurface},
     },
-    Client, ListeningSocket,
 };
 
 impl BufferHandler for App {
@@ -82,10 +82,7 @@ impl DataDeviceHandler for App {
     }
 }
 
-impl ClientDndGrabHandler for App {}
-impl ServerDndGrabHandler for App {
-    fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
-}
+impl WaylandDndGrabHandler for App {}
 
 impl CompositorHandler for App {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -119,6 +116,8 @@ impl SeatHandler for App {
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
 }
+
+impl PointerConstraintsHandler for App {}
 
 struct App {
     compositor_state: CompositorState,
@@ -169,7 +168,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 200).unwrap();
 
-    std::env::set_var("WAYLAND_DISPLAY", "wayland-5");
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", "wayland-5") };
     std::process::Command::new("weston-terminal").spawn().ok();
 
     loop {
@@ -182,7 +181,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         event.key_code(),
                         event.state(),
                         0.into(),
-                        0,
+                        InputTime::now(),
                         |_, _, _| {
                             //
                             FilterResult::Forward
@@ -238,7 +237,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Some(stream) = listener.accept()? {
-                println!("Got a client: {:?}", stream);
+                tracing::info!("Got a client: {:?}", stream);
 
                 let client = display
                     .handle()
@@ -264,7 +263,7 @@ pub fn send_frames_surface_tree(surface: &wl_surface::WlSurface, time: u32) {
         |_, _, &()| TraversalAction::DoChildren(()),
         |_surf, states, &()| {
             // the surface may not have any user_data if it is a subsurface and has not
-            // yet been commited
+            // yet been committed
             for callback in states
                 .cached_state
                 .get::<SurfaceAttributes>()
@@ -285,17 +284,12 @@ struct ClientState {
 }
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {
-        println!("initialized");
+        tracing::info!("initialized");
     }
 
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
-        println!("disconnected");
+        tracing::info!("disconnected");
     }
 }
 
-// Macros used to delegate protocol handling to types in the app state.
-delegate_xdg_shell!(App);
-delegate_compositor!(App);
-delegate_shm!(App);
-delegate_seat!(App);
-delegate_data_device!(App);
+smithay::delegate_dispatch2!(App);

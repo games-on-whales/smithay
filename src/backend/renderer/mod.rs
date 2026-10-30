@@ -7,8 +7,8 @@
 //!
 //! - Raw OpenGL ES 2
 
-use crate::utils::{ids::id_gen, Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform};
-use cgmath::Matrix3;
+use crate::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform, ids::id_gen};
+use glam::Affine2;
 use std::{
     any::TypeId,
     cmp::Ordering,
@@ -36,15 +36,15 @@ pub mod pixman;
 mod color;
 pub use color::Color32F;
 
-use crate::backend::allocator::{dmabuf::Dmabuf, Format, Fourcc};
+use crate::backend::allocator::{Format, Fourcc, dmabuf::Dmabuf};
 #[cfg(all(
     feature = "wayland_frontend",
     feature = "backend_egl",
     feature = "use_system_lib"
 ))]
 use crate::backend::egl::{
-    display::{EGLBufferReader, BUFFER_READER},
     Error as EglError,
+    display::{BUFFER_READER, EGLBufferReader},
 };
 
 use super::allocator::format::FormatSet;
@@ -59,6 +59,7 @@ pub mod element;
 pub mod damage;
 
 pub mod sync;
+use sync::SyncPoint;
 
 // Note: This doesn't fully work yet due to <https://github.com/rust-lang/rust/issues/67295>.
 // Use `--features renderer_test` when running doc tests manually.
@@ -94,11 +95,11 @@ impl<T: Texture> ContextId<T> {
     /// Returns an [`ErasedContextId`] representing this context without the texture type.
     ///
     /// This is useful when storing or comparing contexts across different texture types.
-    pub fn erased(self) -> ErasedContextId
+    pub fn erased(&self) -> ErasedContextId
     where
         T: 'static,
     {
-        ErasedContextId(self.0, TypeId::of::<T>())
+        ErasedContextId(self.0.clone(), TypeId::of::<T>())
     }
 }
 
@@ -178,16 +179,16 @@ pub enum TextureFilter {
 impl Transform {
     /// A projection matrix to apply this transformation
     #[inline]
-    pub fn matrix(&self) -> Matrix3<f32> {
+    pub fn matrix(&self) -> Affine2 {
         match self {
-            Transform::Normal => Matrix3::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::_90 => Matrix3::new(0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::_180 => Matrix3::new(-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::_270 => Matrix3::new(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped => Matrix3::new(-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped90 => Matrix3::new(0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped180 => Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped270 => Matrix3::new(0.0, -1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            Transform::Normal => Affine2::IDENTITY,
+            Transform::_90 => Affine2::from_cols_array(&[0.0, -1.0, 1.0, 0.0, 0.0, 0.0]),
+            Transform::_180 => Affine2::from_cols_array(&[-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]),
+            Transform::_270 => Affine2::from_cols_array(&[0.0, 1.0, -1.0, 0.0, 0.0, 0.0]),
+            Transform::Flipped => Affine2::from_cols_array(&[-1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            Transform::Flipped90 => Affine2::from_cols_array(&[0.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
+            Transform::Flipped180 => Affine2::from_cols_array(&[1.0, 0.0, 0.0, -1.0, 0.0, 0.0]),
+            Transform::Flipped270 => Affine2::from_cols_array(&[0.0, -1.0, -1.0, 0.0, 0.0, 0.0]),
         }
     }
 }
@@ -342,7 +343,10 @@ pub trait Frame {
     /// Output transformation that is applied to this frame
     fn transformation(&self) -> Transform;
 
-    /// Wait for a [`SyncPoint`](sync::SyncPoint) to be signaled
+    /// Output size this frame was initialized for.
+    fn output_size(&self) -> Size<i32, Physical>;
+
+    /// Wait for a [`SyncPoint`] to be signaled
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error>;
 
     /// Finish this [`Frame`] returning any error that may happen during any cleanup.
@@ -356,6 +360,16 @@ pub trait Frame {
     /// Leaking might make the renderer return Errors and force it's recreation.
     /// Leaking may not cause otherwise undefined behavior and program execution will always continue normally.
     fn finish(self) -> Result<sync::SyncPoint, Self::Error>;
+}
+
+/// Helper trait for [`Frame`]s, that allow referencing the underlying renderer
+/// to create additional frames for offscreen targets.
+pub trait FrameContext<'a, 'frame, 'buffer, R: Renderer>: Frame {
+    /// Type returned by [`FrameContext::renderer`] which derefs into the underlying [`Renderer`].
+    type Guard: fmt::Debug + AsRef<R> + AsMut<R> + 'a;
+
+    /// Receive the underlying [`Renderer`]
+    fn renderer(&'a mut self) -> Self::Guard;
 }
 
 bitflags::bitflags! {
@@ -419,7 +433,7 @@ pub trait Renderer: RendererSuper {
     where
         'buffer: 'frame;
 
-    /// Wait for a [`SyncPoint`](sync::SyncPoint) to be signaled
+    /// Wait for a [`SyncPoint`] to be signaled
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error>;
 
     /// Forcibly clean up the renderer internal texture cache
@@ -431,6 +445,19 @@ pub trait Renderer: RendererSuper {
     /// system resource usage.
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Drop all internal caches, freeing their resources unconditionally
+    ///
+    /// Unlike [`Renderer::cleanup_texture_cache`], this also discards cached imports and bind
+    /// targets whose source buffers are still alive.
+    ///
+    /// Note: Caches held outside the renderer, like per-surface textures in surface user-data,
+    /// are unaffected.
+    ///
+    /// The default implementation falls back to [`Renderer::cleanup_texture_cache`].
+    fn invalidate_caches(&mut self) -> Result<(), Self::Error> {
+        self.cleanup_texture_cache()
     }
 }
 
@@ -745,7 +772,7 @@ pub trait ExportMem: Renderer {
     ///
     /// This function *may* fail, if:
     /// - There is not enough space to create the mapping
-    /// - The texture does no allow copying for implementation-specfic reasons
+    /// - The texture does no allow copying for implementation-specific reasons
     /// - It is not possible to convert the texture into the provided format.
     fn copy_texture(
         &mut self,
@@ -761,7 +788,7 @@ pub trait ExportMem: Renderer {
     /// method returns `true`.
     ///
     /// This function *may* fail, if:
-    /// - A readability test did successfully complete (not that it returned `unreadble`!)
+    /// - A readability test did successfully complete (not that it returned `unreadable`!)
     /// - Any of the state of the renderer is irrevesibly changed
     fn can_read_texture(&mut self, texture: &Self::TextureId) -> Result<bool, Self::Error>;
 
@@ -772,7 +799,7 @@ pub trait ExportMem: Renderer {
     /// This function *may* fail, if (but not limited to):
     /// - There is not enough space in memory
     fn map_texture<'a>(&mut self, texture_mapping: &'a Self::TextureMapping)
-        -> Result<&'a [u8], Self::Error>;
+    -> Result<&'a [u8], Self::Error>;
 }
 
 /// Trait for renderers supporting blitting contents from one framebuffer to another.
@@ -802,7 +829,7 @@ where
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<SyncPoint, Self::Error>;
 }
 
 /// Trait for frames supporting blitting contents from/to the current framebuffer to/from another.
@@ -829,7 +856,7 @@ where
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<SyncPoint, Self::Error>;
 
     /// Copies the contents of the provided framebuffer to `dst` in the bound framebuffer,
     /// applying `filter` if necessary.
@@ -850,7 +877,7 @@ where
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<SyncPoint, Self::Error>;
 }
 
 #[cfg(feature = "wayland_frontend")]

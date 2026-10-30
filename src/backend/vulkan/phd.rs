@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString};
 use ash::{ext, khr, prelude::VkResult, vk};
 use tracing::info_span;
 
-use super::{version::Version, DriverInfo, PhdInfo, UnsupportedProperty};
+use super::{DriverInfo, PhdInfo, UnsupportedProperty, version::Version};
 
 impl super::PhysicalDevice {
     /// # Safety:
@@ -100,7 +100,7 @@ impl super::PhdInfo {
             .iter()
             .any(|name| name.as_c_str() == ext::physical_device_drm::NAME)
         {
-            // SAFETY: The caller has garunteed the physical device supports VK_EXT_physical_device_drm
+            // SAFETY: The caller has guaranteed the physical device supports VK_EXT_physical_device_drm
             let next = info
                 .properties_drm
                 .insert(vk::PhysicalDeviceDrmPropertiesEXT::default());

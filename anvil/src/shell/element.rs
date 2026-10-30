@@ -1,21 +1,27 @@
 use std::{borrow::Cow, time::Duration};
 
 use smithay::{
-    backend::renderer::{
-        element::{solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement, AsRenderElements},
-        ImportAll, ImportMem, Renderer, Texture,
+    backend::{
+        input::InputTime,
+        renderer::{
+            ImportAll, ImportMem, Renderer, Texture,
+            element::{
+                AsRenderElements, solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
+            },
+        },
     },
     desktop::{
-        space::SpaceElement, utils::OutputPresentationFeedback, Window, WindowSurface, WindowSurfaceType,
+        Window, WindowSurface, WindowSurfaceType, space::SpaceElement, utils::OutputPresentationFeedback,
     },
     input::{
+        Seat,
         pointer::{
             AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
             GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
             GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
         },
-        touch::TouchTarget,
-        Seat,
+        tablet::tool::TabletToolTarget,
+        touch::{FrameMarker, TouchTarget},
     },
     output::Output,
     reexports::{
@@ -23,12 +29,12 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     render_elements,
-    utils::{user_data::UserDataMap, IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial},
+    utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, user_data::UserDataMap},
     wayland::{compositor::SurfaceData as WlSurfaceData, dmabuf::DmabufFeedback, seat::WaylandFocus},
 };
 
 use super::ssd::HEADER_BAR_HEIGHT;
-use crate::{focus::PointerFocusTarget, state::Backend, AnvilState};
+use crate::{AnvilState, focus::PointerFocusTarget, state::Backend};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowElement(pub Window);
@@ -211,7 +217,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
         _seat: &Seat<AnvilState<BackendData>>,
         _data: &mut AnvilState<BackendData>,
         _serial: Serial,
-        _time: u32,
+        _time: InputTime,
     ) {
         let mut state = self.0.decoration_state();
         if state.is_ssd {
@@ -282,7 +288,6 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         seat: &Seat<AnvilState<BackendData>>,
         data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::DownEvent,
-        _seq: Serial,
     ) {
         let mut state = self.0.decoration_state();
         if state.is_ssd {
@@ -295,12 +300,11 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         &self,
         seat: &Seat<AnvilState<BackendData>>,
         data: &mut AnvilState<BackendData>,
-        event: &smithay::input::touch::UpEvent,
-        _seq: Serial,
+        _event: &smithay::input::touch::UpEvent,
     ) {
         let mut state = self.0.decoration_state();
         if state.is_ssd {
-            state.header_bar.touch_up(seat, data, &self.0, event.serial);
+            state.header_bar.touch_up(seat, data, &self.0);
         }
     }
 
@@ -309,7 +313,6 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         _seat: &Seat<AnvilState<BackendData>>,
         _data: &mut AnvilState<BackendData>,
         event: &smithay::input::touch::MotionEvent,
-        _seq: Serial,
     ) {
         let mut state = self.0.decoration_state();
         if state.is_ssd {
@@ -321,7 +324,7 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         &self,
         _seat: &Seat<AnvilState<BackendData>>,
         _data: &mut AnvilState<BackendData>,
-        _seq: Serial,
+        _marker: FrameMarker,
     ) {
     }
 
@@ -329,7 +332,7 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         &self,
         _seat: &Seat<AnvilState<BackendData>>,
         _data: &mut AnvilState<BackendData>,
-        _seq: Serial,
+        _marker: FrameMarker,
     ) {
     }
 
@@ -338,7 +341,6 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         _seat: &Seat<AnvilState<BackendData>>,
         _data: &mut AnvilState<BackendData>,
         _event: &smithay::input::touch::ShapeEvent,
-        _seq: Serial,
     ) {
     }
 
@@ -347,7 +349,110 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
         _seat: &Seat<AnvilState<BackendData>>,
         _data: &mut AnvilState<BackendData>,
         _event: &smithay::input::touch::OrientationEvent,
-        _seq: Serial,
+    ) {
+    }
+
+    fn last_frame(
+        &self,
+        _seat: &Seat<AnvilState<BackendData>>,
+        _data: &mut AnvilState<BackendData>,
+    ) -> Option<FrameMarker> {
+        // It would be more correct to store the marker on frame and cancel,
+        // but since we're ignoring those anyway, no need for the added complexity.
+        None
+    }
+}
+
+impl<BackendData: Backend> TabletToolTarget<AnvilState<BackendData>> for SSD {
+    fn proximity_in(
+        &self,
+        _seat: &Seat<AnvilState<BackendData>>,
+        _data: &mut AnvilState<BackendData>,
+        _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        _tablet: &smithay::input::tablet::Tablet,
+        _serial: Serial,
+    ) {
+    }
+
+    fn proximity_out(
+        &self,
+        _seat: &Seat<AnvilState<BackendData>>,
+        _data: &mut AnvilState<BackendData>,
+        _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+    ) {
+        let mut state = self.0.decoration_state();
+        if state.is_ssd {
+            state.header_bar.pointer_leave();
+        }
+    }
+
+    fn down(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        event: &smithay::input::tablet::tool::DownEvent,
+    ) {
+        let mut state = self.0.decoration_state();
+        if state.is_ssd {
+            state.header_bar.touch_down(seat, data, &self.0, event.serial);
+        }
+    }
+
+    fn up(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        _event: &smithay::input::tablet::tool::UpEvent,
+    ) {
+        let mut state = self.0.decoration_state();
+        if state.is_ssd {
+            state.header_bar.touch_up(seat, data, &self.0);
+        }
+    }
+
+    fn motion(
+        &self,
+        _seat: &Seat<AnvilState<BackendData>>,
+        _data: &mut AnvilState<BackendData>,
+        _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        event: &smithay::input::tablet::tool::MotionEvent,
+    ) {
+        let mut state = self.0.decoration_state();
+        if state.is_ssd {
+            state.header_bar.pointer_enter(event.location);
+        }
+    }
+
+    fn button(
+        &self,
+        seat: &Seat<AnvilState<BackendData>>,
+        data: &mut AnvilState<BackendData>,
+        _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        event: &smithay::input::tablet::tool::ButtonEvent,
+    ) {
+        let mut state = self.0.decoration_state();
+        if state.is_ssd {
+            state.header_bar.clicked(seat, data, &self.0, event.serial);
+        }
+    }
+
+    fn axis(
+        &self,
+        _seat: &Seat<AnvilState<BackendData>>,
+        _data: &mut AnvilState<BackendData>,
+        _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        _frame: smithay::input::tablet::tool::AxisFrame,
+    ) {
+    }
+
+    fn frame(
+        &self,
+        _seat: &Seat<AnvilState<BackendData>>,
+        _data: &mut AnvilState<BackendData>,
+        _tool_descriptor: &smithay::backend::input::TabletToolDescriptor,
+        _time: InputTime,
     ) {
     }
 }

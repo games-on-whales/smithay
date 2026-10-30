@@ -6,19 +6,18 @@ use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
     self, ChangeCause, ContentHint, ContentPurpose, ZwpTextInputV3,
 };
 use wayland_server::backend::{ClientId, ObjectId};
-use wayland_server::{protocol::wl_surface::WlSurface, Dispatch, Resource};
+use wayland_server::{Resource, protocol::wl_surface::WlSurface};
 
 use crate::input::SeatHandler;
 use crate::utils::{Logical, Rectangle};
-use crate::wayland::input_method::InputMethodHandle;
-
-use super::TextInputManagerState;
+use crate::wayland::{Dispatch2, input_method::InputMethodHandle, text_input::TextInputActivation};
 
 #[derive(Default, Debug)]
 pub(crate) struct TextInput {
     instances: Vec<Instance>,
     focus: Option<WlSurface>,
     active_text_input_id: Option<ObjectId>,
+    compositor_input_method: bool,
 }
 
 impl TextInput {
@@ -31,7 +30,6 @@ impl TextInput {
                 let instance_id = text_input.instance.id();
                 if instance_id.same_client_as(&surface.id()) {
                     f(&text_input.instance, surface, text_input.serial);
-                    break;
                 }
             }
         };
@@ -127,6 +125,33 @@ impl TextInputHandle {
         });
     }
 
+    /// Have the compositor act as the input method for this seat.
+    ///
+    /// While enabled, `enter` is delivered to the focused text-input even when no real
+    /// `zwp_input_method_v2` is bound, so the compositor can `commit_string` into it (e.g. for
+    /// remote-desktop text injection). Toggling this sends `enter`/`leave` for the current
+    /// focus immediately; subsequent focus changes are handled by the keyboard focus logic.
+    pub fn set_compositor_input_method(&self, active: bool) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.compositor_input_method == active {
+                return;
+            }
+            inner.compositor_input_method = active;
+        }
+        if active {
+            self.enter();
+        } else {
+            self.leave();
+        }
+    }
+
+    /// Whether the compositor is currently acting as the input method for this seat
+    /// (see [`set_compositor_input_method`](Self::set_compositor_input_method)).
+    pub fn compositor_input_method(&self) -> bool {
+        self.inner.lock().unwrap().compositor_input_method
+    }
+
     /// The `discard_state` is used when the input-method signaled that
     /// the state should be discarded and wrong serial sent.
     pub fn done(&self, discard_state: bool) {
@@ -142,7 +167,7 @@ impl TextInputHandle {
         });
     }
 
-    /// Access the text-input instance for the currently focused surface.
+    /// Access the text-input instances for the currently focused surface.
     pub fn with_focused_text_input<F>(&self, mut f: F)
     where
         F: FnMut(&ZwpTextInputV3, &WlSurface),
@@ -189,33 +214,36 @@ pub struct TextInputUserData {
     pub(crate) input_method_handle: InputMethodHandle,
 }
 
-impl<D> Dispatch<ZwpTextInputV3, TextInputUserData, D> for TextInputManagerState
+impl<D> Dispatch2<ZwpTextInputV3, D> for TextInputUserData
 where
-    D: Dispatch<ZwpTextInputV3, TextInputUserData>,
     D: SeatHandler,
+    D: TextInputActivation,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &wayland_server::Client,
         resource: &ZwpTextInputV3,
         request: zwp_text_input_v3::Request,
-        data: &TextInputUserData,
         _dhandle: &wayland_server::DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
         // Always increment serial to not desync with clients.
         if matches!(request, zwp_text_input_v3::Request::Commit) {
-            data.handle.increment_serial(resource);
+            self.handle.increment_serial(resource);
         }
 
-        // Discard requsets without any active input method instance.
-        if !data.input_method_handle.has_instance() {
+        // Discard requests without any active input method instance, unless the compositor
+        // itself is acting as the input method for this seat (the text-injection escape hatch).
+        // In that case we still process enable/commit so the focused client becomes the active
+        // text input and the compositor can `commit_string` into it.
+        if !self.input_method_handle.has_instance() && !self.handle.compositor_input_method() {
             debug!("discarding text-input request without IME running");
             return;
         }
 
-        let focus = match data.handle.focus() {
+        let focus = match self.handle.focus() {
             Some(focus) if focus.id().same_client_as(&resource.id()) => focus,
             _ => {
                 debug!("discarding text-input request for unfocused client");
@@ -223,7 +251,7 @@ where
             }
         };
 
-        let mut guard = data.handle.inner.lock().unwrap();
+        let mut guard = self.handle.inner.lock().unwrap();
         let pending_state = match guard.instances.iter_mut().find_map(|instance| {
             if instance.instance == *resource {
                 Some(&mut instance.pending_state)
@@ -249,11 +277,15 @@ where
                 pending_state.surrounding_text = Some((text, cursor as u32, anchor as u32));
             }
             zwp_text_input_v3::Request::SetTextChangeCause { cause } => {
-                pending_state.text_change_cause = Some(cause.into_result().unwrap());
+                // Guard against clients sending us unknown values from future versions.
+                let cause = cause.into_result().unwrap_or(ChangeCause::Other);
+                pending_state.text_change_cause = Some(cause);
             }
             zwp_text_input_v3::Request::SetContentType { hint, purpose } => {
-                pending_state.content_type =
-                    Some((hint.into_result().unwrap(), purpose.into_result().unwrap()));
+                // Guard against clients sending us unknown values from future versions.
+                let hint = ContentHint::from_bits_truncate(u32::from(hint));
+                let purpose = purpose.into_result().unwrap_or(ContentPurpose::Normal);
+                pending_state.content_type = Some((hint, purpose));
             }
             zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
                 pending_state.cursor_rectangle = Some(Rectangle::new((x, y).into(), (width, height).into()));
@@ -273,13 +305,15 @@ where
                         *active_text_input_id = Some(resource.id());
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
-                        data.input_method_handle.activate_input_method(state, &focus);
+                        self.input_method_handle.activate_input_method(state, &focus);
+                        state.activated(new_state.content_type);
                     }
                     Some(false) => {
                         *active_text_input_id = None;
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
-                        data.input_method_handle.deactivate_input_method(state);
+                        self.input_method_handle.deactivate_input_method(state);
+                        state.deactivated();
                         return;
                     }
                     None => {
@@ -294,29 +328,29 @@ where
                 }
 
                 if let Some((text, cursor, anchor)) = new_state.surrounding_text.take() {
-                    data.input_method_handle.with_instance(move |input_method| {
+                    self.input_method_handle.with_instance(move |input_method| {
                         input_method.object.surrounding_text(text, cursor, anchor)
                     });
                 }
 
                 if let Some(cause) = new_state.text_change_cause.take() {
-                    data.input_method_handle.with_instance(move |input_method| {
+                    self.input_method_handle.with_instance(move |input_method| {
                         input_method.object.text_change_cause(cause);
                     });
                 }
 
                 if let Some((hint, purpose)) = new_state.content_type.take() {
-                    data.input_method_handle.with_instance(move |input_method| {
+                    self.input_method_handle.with_instance(move |input_method| {
                         input_method.object.content_type(hint, purpose);
                     });
                 }
 
                 if let Some(rect) = new_state.cursor_rectangle.take() {
-                    data.input_method_handle
+                    self.input_method_handle
                         .set_text_input_rectangle::<D>(state, rect);
                 }
 
-                data.input_method_handle.with_instance(|input_method| {
+                self.input_method_handle.with_instance(|input_method| {
                     input_method.done();
                 });
             }
@@ -327,10 +361,10 @@ where
         }
     }
 
-    fn destroyed(state: &mut D, _client: ClientId, text_input: &ZwpTextInputV3, data: &TextInputUserData) {
+    fn destroyed(&self, state: &mut D, _client: ClientId, text_input: &ZwpTextInputV3) {
         let destroyed_id = text_input.id();
         let deactivate_im = {
-            let mut inner = data.handle.inner.lock().unwrap();
+            let mut inner = self.handle.inner.lock().unwrap();
             inner.instances.retain(|inst| inst.instance.id() != destroyed_id);
             let destroyed_focused = inner
                 .focus
@@ -348,7 +382,8 @@ where
         };
 
         if deactivate_im {
-            data.input_method_handle.deactivate_input_method(state);
+            self.input_method_handle.deactivate_input_method(state);
+            state.deactivated();
         }
     }
 }

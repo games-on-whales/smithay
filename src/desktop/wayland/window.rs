@@ -1,11 +1,13 @@
+#[cfg(feature = "wayland_frontend")]
+use crate::utils::Serial;
 #[cfg(feature = "xwayland")]
 use crate::{desktop::space::SpaceElement, xwayland::X11Surface};
 use crate::{
-    desktop::{space::RenderZindex, utils::*, PopupManager},
+    desktop::{PopupManager, space::RenderZindex, utils::*},
     output::Output,
-    utils::{user_data::UserDataMap, IsAlive, Logical, Point, Rectangle},
+    utils::{IsAlive, Logical, Point, Rectangle, user_data::UserDataMap},
     wayland::{
-        compositor::{with_states, SurfaceData},
+        compositor::{SurfaceData, with_states},
         dmabuf::DmabufFeedback,
         seat::WaylandFocus,
         shell::xdg::{SurfaceCachedState, ToplevelSurface},
@@ -15,8 +17,8 @@ use std::{
     borrow::Cow,
     hash::{Hash, Hasher},
     sync::{
+        Arc, Mutex, Weak,
         atomic::{AtomicU8, Ordering},
-        Arc, Mutex,
     },
     time::Duration,
 };
@@ -29,6 +31,7 @@ crate::utils::ids::id_gen!(window_id);
 
 /// Represents the surface of a [`Window`]
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum WindowSurface {
     /// An xdg toplevel surface
     Wayland(ToplevelSurface),
@@ -49,6 +52,50 @@ pub(crate) struct WindowInner {
 impl Drop for WindowInner {
     fn drop(&mut self) {
         window_id::remove(self.id);
+    }
+}
+
+/// Represents possible errors returned from a window ping
+#[derive(Debug, thiserror::Error)]
+#[cfg(feature = "wayland_frontend")]
+pub enum PingError {
+    /// This window's underlying surface does not support a ping protocol
+    #[error("Ping not supported for this window")]
+    NotSupported,
+    /// The operation failed because the underlying surface has been destroyed
+    #[error("The ping failed because the underlying surface has been destroyed")]
+    DeadSurface,
+    /// The provided serial cannot be used for a ping
+    #[error("Invalid serial for ping")]
+    InvalidSerial,
+    /// There is already a ping pending
+    #[error("There is already a ping pending `{0:?}`")]
+    PingAlreadyPending(Serial),
+}
+
+#[cfg(feature = "wayland_frontend")]
+impl From<crate::wayland::shell::PingError> for PingError {
+    fn from(value: crate::wayland::shell::PingError) -> Self {
+        use crate::wayland::shell::PingError;
+
+        match value {
+            PingError::DeadSurface => Self::DeadSurface,
+            PingError::PingAlreadyPending(serial) => Self::PingAlreadyPending(serial),
+        }
+    }
+}
+
+#[cfg(feature = "xwayland")]
+impl From<crate::xwayland::xwm::PingError> for PingError {
+    fn from(value: crate::xwayland::xwm::PingError) -> Self {
+        use crate::xwayland::xwm::PingError;
+
+        match value {
+            PingError::NotSupported => Self::NotSupported,
+            PingError::InvalidTimestamp => Self::InvalidSerial,
+            PingError::PingAlreadyPending(timestamp) => Self::PingAlreadyPending(Serial(timestamp)),
+            PingError::Connection(_) => Self::DeadSurface,
+        }
     }
 }
 
@@ -80,6 +127,29 @@ impl IsAlive for Window {
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(s) => s.alive(),
         }
+    }
+}
+
+impl Window {
+    /// Create a weak reference to this window that does not prevent
+    /// the inner resources from being dropped.
+    pub fn downgrade(&self) -> WeakWindow {
+        WeakWindow(Arc::downgrade(&self.0))
+    }
+}
+
+/// A weak reference to a [`Window`] that does not keep it alive.
+///
+/// Use [`WeakWindow::upgrade`] to obtain a [`Window`] if the inner
+/// resources have not yet been dropped.
+#[derive(Debug, Clone)]
+pub struct WeakWindow(Weak<WindowInner>);
+
+impl WeakWindow {
+    /// Attempt to upgrade to a strong [`Window`] reference.
+    /// Returns `None` if the window has already been dropped.
+    pub fn upgrade(&self) -> Option<Window> {
+        self.0.upgrade().map(Window)
     }
 }
 
@@ -137,6 +207,11 @@ impl Window {
         }))
     }
 
+    /// Returns the window ID
+    pub fn id(&self) -> usize {
+        self.0.id
+    }
+
     /// Checks if the window is a wayland one.
     #[inline]
     pub fn is_wayland(&self) -> bool {
@@ -152,21 +227,23 @@ impl Window {
 
     /// Returns the geometry of this window.
     pub fn geometry(&self) -> Rectangle<i32, Logical> {
-        let bbox = self.bbox();
+        match self.underlying_surface() {
+            WindowSurface::Wayland(s) => {
+                let bbox = self.bbox();
+                // It's the set geometry clamped to the bounding box with the full bounding box as the fallback.
+                with_states(s.wl_surface(), |states| {
+                    states
+                        .cached_state
+                        .get::<SurfaceCachedState>()
+                        .current()
+                        .geometry
+                        .and_then(|geo| geo.intersection(bbox))
+                })
+                .unwrap_or(bbox)
+            }
 
-        if let Some(surface) = self.wl_surface() {
-            // It's the set geometry clamped to the bounding box with the full bounding box as the fallback.
-            with_states(&surface, |states| {
-                states
-                    .cached_state
-                    .get::<SurfaceCachedState>()
-                    .current()
-                    .geometry
-                    .and_then(|geo| geo.intersection(bbox))
-            })
-            .unwrap_or(bbox)
-        } else {
-            bbox
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(s) => SpaceElement::geometry(s),
         }
     }
 
@@ -216,6 +293,28 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// Sends a ping to the window to check that the client is still responding.
+    ///
+    /// For `xdg_toplevel` surfaces, you can implement
+    /// [`XdgShellHandler::client_pong`](crate::wayland::shell::xdg::XdgShellHandler::client_pong)
+    /// to be notified of replies.
+    ///
+    /// For X11/XWayland surfaces, you can implement
+    /// [`XwmHandler::ping_acked`](crate::xwayland::XwmHandler::ping_acked) to be notified of
+    /// replies.
+    ///
+    /// Fails if the window's underlying surface does not support a ping protocol, is dead, or
+    /// already has a pending ping.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn send_ping(&self, serial: Serial) -> Result<(), PingError> {
+        match &self.0.surface {
+            WindowSurface::Wayland(s) => s.client().send_ping(serial)?,
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(s) => s.send_ping(serial.0)?,
+        }
+        Ok(())
     }
 
     /// Sends the frame callback to all the subsurfaces in this window that requested it
@@ -339,20 +438,30 @@ impl Window {
         surface_type: WindowSurfaceType,
     ) -> Option<(wl_surface::WlSurface, Point<i32, Logical>)> {
         let point = point.into();
-        if let Some(surface) = self.wl_surface() {
-            if surface_type.contains(WindowSurfaceType::POPUP) {
-                for (popup, location) in PopupManager::popups_for_surface(&surface) {
-                    let offset = self.geometry().loc + location - popup.geometry().loc;
-                    if let Some(result) =
-                        under_from_surface_tree(popup.wl_surface(), point, offset, surface_type)
-                    {
-                        return Some(result);
+
+        match &self.0.surface {
+            WindowSurface::Wayland(surface) => {
+                let surface = surface.wl_surface();
+                if surface_type.contains(WindowSurfaceType::POPUP) {
+                    for (popup, location) in PopupManager::popups_for_surface(surface) {
+                        let offset = self.geometry().loc + location - popup.geometry().loc;
+                        if let Some(result) =
+                            under_from_surface_tree(popup.wl_surface(), point, offset, surface_type)
+                        {
+                            return Some(result);
+                        }
                     }
                 }
-            }
 
-            if surface_type.contains(WindowSurfaceType::TOPLEVEL) {
-                return under_from_surface_tree(&surface, point, (0, 0), surface_type);
+                if surface_type.contains(WindowSurfaceType::TOPLEVEL) {
+                    return under_from_surface_tree(surface, point, (0, 0), surface_type);
+                }
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => {
+                if surface_type.contains(WindowSurfaceType::TOPLEVEL) {
+                    return surface.surface_under(point, (0, 0), surface_type);
+                }
             }
         }
 

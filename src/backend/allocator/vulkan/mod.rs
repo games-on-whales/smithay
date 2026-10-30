@@ -16,15 +16,13 @@
 //! To get the required extensions a device must support to use the Vulkan allocator, use
 //! [`VulkanAllocator::required_extensions`].
 
-#![forbid(unsafe_op_in_unsafe_fn)]
-
 pub mod format;
 
 use std::{
     ffi::CStr,
     fmt,
     os::unix::io::{FromRawFd, OwnedFd},
-    sync::{mpsc, Arc, Weak},
+    sync::{Arc, Weak, mpsc},
 };
 
 use ash::{ext, khr, vk};
@@ -37,14 +35,14 @@ use crate::backend::drm::DrmNode;
 use crate::{
     backend::{
         allocator::dmabuf::DmabufFlags,
-        vulkan::{version::Version, PhysicalDevice},
+        vulkan::{PhysicalDevice, version::Version},
     },
     utils::{Buffer as BufferCoord, Size},
 };
 
 use super::{
-    dmabuf::{AsDmabuf, Dmabuf, MAX_PLANES},
     Allocator, Buffer,
+    dmabuf::{AsDmabuf, Dmabuf, MAX_PLANES},
 };
 
 bitflags! {
@@ -448,7 +446,7 @@ impl AsDmabuf for VulkanImage {
 
         let fd = unsafe { self.khr_external_memory_fd.get_memory_fd(&create_info) }?;
         // SAFETY: `vkGetMemoryFdKHR` creates a new file descriptor owned by the caller.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
         let mut builder = Dmabuf::builder(
             self.size(),
             self.format().code,
@@ -470,12 +468,7 @@ impl AsDmabuf for VulkanImage {
             // VUID-vkGetImageSubresourceLayout-image-02270: All allocate images are created with drm tiling
             let subresource = vk::ImageSubresource::default().aspect_mask(aspect_mask);
             let layout = unsafe { device.get_image_subresource_layout(self.inner.image, subresource) };
-            builder.add_plane(
-                fd.try_clone().or(Err(ExportError::Failed))?,
-                idx,
-                layout.offset as u32,
-                layout.row_pitch as u32,
-            );
+            builder.add_plane(fd.clone(), layout.offset as u32, layout.row_pitch as u32);
         }
 
         #[cfg(feature = "backend_drm")]
